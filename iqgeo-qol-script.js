@@ -1965,14 +1965,24 @@ function runWhenReady(readySelector, callback) {
             segmentRequests[segment] = (async () => {
                 // Set whether to override local storage
                 forceRefresh = forceRefreshParam;
-                console.log(`Getting segment: ${segment}, forceRefresh: ${forceRefresh}`);
+                // console.log(`Getting segment: ${segment}, forceRefresh: ${forceRefresh}`);
                 // console.log('interceptedData:', interceptedData);
                 
-                const [segmentType, segmentId] = segment.split('/');
+                const [segmentType, segmentId] = segment.replace(/in|out/, '').split('/');
                 let segmentData;
+                let cachedSaved = null;
 
                 if (!forceRefresh) {
-                    segmentData = await loadFeatureInfo(segmentType, segmentId);
+                    const cached = await loadFeatureInfo(segmentType, segmentId);
+                    if (cached) {
+                        try {
+                            const cacheRaw = JSON.parse(localStorage.getItem(segmentType) || "{}");
+                            cachedSaved = cacheRaw?.[segmentId]?.saved || null;
+                        } catch (e) {
+                            /* ignore cache parse issues */
+                        }
+                        segmentData = { saved: cachedSaved, data: cached };
+                    }
                 }
             
                 if (!segmentData) {
