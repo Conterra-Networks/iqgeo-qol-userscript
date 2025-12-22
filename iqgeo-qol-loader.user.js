@@ -1,32 +1,30 @@
 // ==UserScript==
 // @name         IQGeo QOL
-// @description  Loads IQGeo QOL script from GitHub
-// @version      1.0.0
+// @namespace    https://github.com/Conterra-Networks/iqgeo-qol-userscript
+// @version      1.0.1
+// @description  Loader script that fetches and runs the latest IQGeo QOL logic (no grants required).
 // @author       CShepard
-// @match        *://*.nmt.iqgeo.cloud/*
-// @grant        GM_xmlhttpRequest
+// @match        https://*.nmt.iqgeo.cloud/*
 // @run-at       document-start
 // ==/UserScript==
 
-(function() {
-    const scriptUrl = "https://raw.githubusercontent.com/Conterra-Networks/iqgeo-qol-userscript/main/iqgeo-qol-script.js";
+(async function() {
+    const logicUrl = "https://raw.githubusercontent.com/Conterra-Networks/iqgeo-qol-userscript/main/iqgeo-qol-script.js";
 
-    GM_xmlhttpRequest({
-        method: "GET",
-        url: scriptUrl,
-        nocache: true,
-        onload: (response) => {
-            try {
-                const script = document.createElement("script");
-                script.type = "text/javascript";
-                script.textContent = response.responseText;
-                document.documentElement.appendChild(script);
-            } catch (err) {
-                console.error("[IQGeo QOL] Script injection error:", err);
-            }
-        },
-        onerror: (err) => {
-            console.error("[IQGeo QOL] Failed to fetch script file:", err);
-        }
-    });
+    try {
+        const response = await fetch(logicUrl, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const logicCode = await response.text();
+
+        const script = document.createElement("script");
+        script.type = "text/javascript";
+        script.textContent = logicCode;
+
+        // Append early in the DOM so the logic executes immediately
+        document.documentElement.appendChild(script);
+
+    } catch (err) {
+        console.error("[IQGeo QOL] Failed to load logic script:", err);
+    }
 })();
