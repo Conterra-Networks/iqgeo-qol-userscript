@@ -2,7 +2,7 @@
 // @name         IQGeo QOL
 // @namespace    https://github.com/Conterra-Networks/iqgeo-qol-userscript
 // @version      1.0.1
-// @description  Loader script that fetches and runs the latest IQGeo QOL logic (no grants required).
+// @description  Loads latest IQGeo QOL script from GitHub
 // @author       CShepard
 // @match        https://*.nmt.iqgeo.cloud/*
 // @run-at       document-start
@@ -28,3 +28,4 @@
         console.error("[IQGeo QOL] Failed to load logic script:", err);
     }
 })();
+
