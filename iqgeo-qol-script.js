@@ -1,36 +1,163 @@
+(function () {
+    console.log("Conterra's IQGeo QOL Userscript Loaded");
 
-// credit: https://github.com/Tampermonkey/tampermonkey/issues/1279#issuecomment-875386821
-// Convenience function to execute your callback only after an element matching readySelector has been added to the page.
-// Example: runWhenReady('.search-result', augmentSearchResults);
-function runWhenReady(readySelector, callback) {
-    var numAttempts = 0;
-    var tryNow = function () {
-        //console.log('runAtempt: ' + numAttempts);
-        var elem = document.querySelector(readySelector);
-        if (elem) {
-            callback(elem);
-        } else {
-            numAttempts++;
-            if (numAttempts >= 34) {
-                console.warn("Giving up after 34 attempts. Could not find: " + readySelector);
-            } else {
-                setTimeout(tryNow, 250 * Math.pow(1.1, numAttempts));
-            }
+    const iqgeoGreen = "#3CA22D";
+    const HREF = window.location.href;
+    const IS_LOGIN = HREF.includes("/login");
+    const IS_CONFIG = HREF.includes("/config");
+    const IS_MYWCOM = HREF.includes("/mywcom");
+    const NOTIFICATION_POLL_MS = 300_000;
+    const FEATURE_TOGGLES = [
+        { label: "Auto Login", description: "Automatically uses OIDC login method", defaultState: "on", hidden: true },
+        { label: "Design Changes", description: "Highlights pending splice changes in the current design", defaultState: "on", hidden: false },
+        { label: "Details Popup", description: "View the active Details content in a draggable popup", defaultState: "on", hidden: false },
+        { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
+        { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
+        { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "off", hidden: true },
+        { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
+    ];
+    // Features not included:
+    // Splice Calc - Pending code removal
+    // Better Splice Layout - Incomplete code causes unintended results
+
+    // Debug logging configuration
+    const DEBUG_CONFIG = {
+        enabled: false,  // Master toggle - set to true to enable debug logging
+        features: {
+            'Terminations': false,
+            'DesignChanges': false,
+            'DetailsPopup': false,
+            'ErrorMonitor': false,
+            'PluginPatches': false,
+            'SpliceCalc': false
         }
     };
-    tryNow();
-}
 
-(function () {
-    console.log("IQGeo QOL Userscript Loaded");
+    // Hybrid logging utility with per-feature control
+    const logger = {
+        _shouldLog: (feature, level) => {
+            if (!DEBUG_CONFIG.enabled) return level === 'error' || level === 'warn';
+            if (!feature) return DEBUG_CONFIG.enabled;
+            return DEBUG_CONFIG.features[feature] === true || DEBUG_CONFIG.enabled;
+        },
+        
+        debug: (feature, ...args) => {
+            if (logger._shouldLog(feature, 'debug')) {
+                console.debug(`[${feature || 'QOL'}]`, ...args);
+            }
+        },
+        
+        log: (feature, ...args) => {
+            if (logger._shouldLog(feature, 'log')) {
+                console.log(`[${feature || 'QOL'}]`, ...args);
+            }
+        },
+        
+        info: (feature, ...args) => {
+            console.info(`[${feature || 'QOL'}]`, ...args);
+        },
+        
+        warn: (feature, ...args) => {
+            console.warn(`[${feature || 'QOL'}]`, ...args);
+        },
+        
+        error: (feature, ...args) => {
+            console.error(`[${feature || 'QOL'}]`, ...args);
+        }
+    };
 
-    // Global Colors
-    const iqgeoGreen = "#3CA22D";
+    // Expose to window for runtime debugging
+    if (typeof window !== 'undefined') {
+        window.qolDebug = DEBUG_CONFIG;
+    }
+
+    const featureManager = (() => {
+        const states = {};
+        const features = {};
+        let onChange = null;
+
+        function loadState(label, defaultState = "on") {
+            return localStorage.getItem(`qol-menu_${label}`) || defaultState;
+        }
+
+        function persistState(label, state) {
+            localStorage.setItem(`qol-menu_${label}`, state);
+        }
+
+        function notify(label, state) {
+            if (onChange) {
+                onChange(label, state);
+            }
+        }
+
+        function register(label, handlers = {}, options = {}) {
+            const { defaultState = "on" } = options;
+            features[label] = {
+                start: handlers.start,
+                stop: handlers.stop,
+            };
+            if (!states[label]) {
+                states[label] = loadState(label, defaultState);
+            }
+        }
+
+        function setState(label, state) {
+            if (states[label] === state) {
+                return;
+            }
+            states[label] = state;
+            persistState(label, state);
+            if (state === "on") {
+                features[label]?.start?.();
+            } else {
+                features[label]?.stop?.();
+            }
+            notify(label, state);
+        }
+
+        function toggle(label) {
+            const nextState = states[label] === "on" ? "off" : "on";
+            setState(label, nextState);
+        }
+
+        function init() {
+            Object.entries(features).forEach(([label, handlers]) => {
+                if (!states[label]) {
+                    states[label] = loadState(label, "on");
+                }
+                if (states[label] === "on") {
+                    handlers.start?.();
+                }
+            });
+            Object.entries(states).forEach(([label, state]) => notify(label, state));
+        }
+
+        function onStateChange(cb) {
+            onChange = cb;
+        }
+
+        function isEnabled(label) {
+            return states[label] === "on";
+        }
+
+        function getState(label) {
+            return states[label] || loadState(label, "on");
+        }
+
+        return {
+            register,
+            setState,
+            toggle,
+            init,
+            onStateChange,
+            isEnabled,
+            getState,
+        };
+    })();
 
     // credit: https://github.com/Tampermonkey/tampermonkey/issues/1279#issuecomment-875386821
-    // Convenience function to execute your callback only after an element matching readySelector has been added to the page.
+    // Executes callback only after an element matching readySelector has been added to the page
     // Example: runWhenReady('.search-result', augmentSearchResults);
-    // Gives up after 1 minute.
     function runWhenReady(readySelector, callback) {
         var numAttempts = 0;
         var tryNow = function () {
@@ -53,8 +180,6 @@ function runWhenReady(readySelector, callback) {
         tryNow();
     }
 
-    //
-    //
     function createMenu() {
         // Create the style element for CSS
         var style = document.createElement("style");
@@ -70,32 +195,123 @@ function runWhenReady(readySelector, callback) {
 
         .floating-menu {
             position: fixed;
-            top: 50px; /* Adjust the top position as needed */
-            left: calc(100% - 200px); /* Adjust the distance from the left edge */
-            transform: translateX(-100%); /* Shift the menu to the left */
+            top: 52px;
+            right: 160px;
             background-color: #f1f1f1;
-            border: 1px solid #ccc;
-            padding: 10px;
+            border: 1px solid #999;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            padding: 10px 12px;
             z-index: 9999; /* Ensure the menu appears above other elements */
         }
         
-        .floating-menu button {
-            display: block;
-            margin-bottom: 5px;
-            border: none; /* Remove the button border */
-            padding: 5px 10px; /* Add padding for better visual appearance */
-            cursor: pointer; /* Change cursor on hover */
-            color: #333; /* Change button text color */
+        .floating-menu .toggle-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            padding: 2px 0;
         }
 
-        .floating-menu button.on {
-            background-color: green; /* Set background color to indicate 'On' state */
-            color: #fff; /* Change text color to white for better readability */
+        .floating-menu .toggle-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .floating-menu .toggle-label {
+            font-size: 13px;
+            color: #333;
+            cursor: pointer;
+            user-select: none;
+            flex: 1;
+        }
+        
+        /* Toggle switch styling */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 38px;
+            height: 20px;
+            margin-right: 8px;
+            flex-shrink: 0;
+        }
+        
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: 0.3s;
+            border-radius: 20px;
+        }
+        
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+        
+        .toggle-switch input:checked + .toggle-slider {
+            background-color: #3ca22d;
+        }
+        
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(18px);
+        }
+        
+        .toggle-switch input:disabled + .toggle-slider {
+            cursor: not-allowed;
+            opacity: 0.5;
         }
 
-        .floating-menu button.off {
-            background-color: red; /* Set background color to indicate 'Off' state */
-            color: #fff; /* Change text color to white for better readability */
+        /* Splice row alignment */
+        #related-equipment-tree-container {
+            --qol-splice-main: auto;
+        }
+        #related-equipment-tree-container .jstree-anchor {
+            display: inline-block;
+        }
+        #related-equipment-tree-container .jstree-anchor .qol-splice-row {
+            display: grid;
+            grid-template-columns: var(--qol-splice-main, auto) auto;
+            align-items: center;
+            column-gap: 8px;
+        }
+        #related-equipment-tree-container .jstree-anchor .qol-splice-main {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
+        #related-equipment-tree-container .jstree-anchor .design-link {
+            margin-left: 8px;
+            display: inline-block;
+            color: #20b94b;
+            font-size: 12px;
+        }
+        #related-equipment-tree-container .jstree-anchor .fiber-colors {
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+        }
+        #related-equipment-tree-container .jstree-anchor .qol-splice-right {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            justify-content: flex-end;
+            justify-self: end;
         }
         `;
 
@@ -107,8 +323,9 @@ function runWhenReady(readySelector, callback) {
 
         // Create the button element
         var button = document.createElement("button");
-        button.innerHTML = "QOL Menu";
+        button.innerHTML = "Conterra QOL ⚙";
         button.classList.add("qol-menu");
+        button.title = "Toggle Quality of Life Features";
 
         // Add event listener to toggle menu visibility
         button.addEventListener("click", function () {
@@ -124,15 +341,9 @@ function runWhenReady(readySelector, callback) {
         menu.classList.add("floating-menu"); // Add the 'floating-menu' class
         menu.style.display = "none"; // Hide the menu by default
 
-        // Create the toggle buttons and status indicators
-        var toggleButton1 = createToggleButton("Auto Login");
-        var toggleButton2 = createToggleButton("Splice Changes");
-        // var toggleButton3 = createToggleButton("Funny Day 🤪"); // TODO: Allow buttons to be added dynamically from their respective modules
-
-        // Add the toggle buttons to the menu
-        menu.appendChild(toggleButton1);
-        menu.appendChild(toggleButton2);
-        // menu.appendChild(toggleButton3);
+        FEATURE_TOGGLES.filter(f => !f.hidden).forEach((feature) => {
+            menu.appendChild(createToggleButton(feature));
+        });
 
         // Insert the menu just after the header content
         headerContent.parentNode.insertAdjacentElement("afterend", menu);
@@ -153,105 +364,106 @@ function runWhenReady(readySelector, callback) {
         // Move the logo inside the wrapper div
         wrapperDiv.appendChild(logo);
 
-        // Function to create a toggle button
-        function createToggleButton(label) {
-            var button = document.createElement("button");
-            button.innerHTML = label;
-            button.classList.add("on"); // Set the initial state to 'On'
-
-            // Add event listener to toggle the button state
-            button.addEventListener("click", function () {
-                toggleState(label);
+        // Function to create a toggle switch
+        function createToggleButton(feature) {
+            var container = document.createElement("div");
+            container.classList.add("toggle-item");
+            
+            var toggleSwitch = document.createElement("label");
+            toggleSwitch.classList.add("toggle-switch");
+            
+            var input = document.createElement("input");
+            input.type = "checkbox";
+            input.id = "toggle-" + feature.label.replace(/\s+/g, "-").toLowerCase();
+            input.checked = true; // Set the initial state to 'On'
+            
+            var slider = document.createElement("span");
+            slider.classList.add("toggle-slider");
+            
+            // Add event listener to toggle the feature state
+            input.addEventListener("change", function () {
+                featureManager.toggle(feature.label);
             });
-
-            return button;
+            
+            toggleSwitch.appendChild(input);
+            toggleSwitch.appendChild(slider);
+            
+            var label = document.createElement("label");
+            label.classList.add("toggle-label");
+            label.textContent = feature.label;
+            label.title = feature.description;
+            label.htmlFor = "toggle-" + feature.label.replace(/\s+/g, "-").toLowerCase();
+            
+            container.appendChild(toggleSwitch);
+            container.appendChild(label);
+            
+            return container;
         }
 
-        // Set the initial state of the toggle buttons based on the stored toggle states
+        featureManager.onStateChange(updateToggleButton);
         setToggleStates();
 
-        // Function to set the toggle state
-        function setToggleState(label, state) {
-            // Update the state of the toggle button based on the provided label and state
-            var toggleButton = getToggleButtonByLabel(label);
-            if (toggleButton) {
-                toggleButton.classList.remove("on", "off");
-                toggleButton.classList.add(state);
+        function updateToggleButton(label, state) {
+            var toggleInput = getToggleInputByLabel(label);
+            if (toggleInput) {
+                toggleInput.checked = (state === "on");
             }
-
-            // Store the current toggle state in localStorage
-            localStorage.setItem(`qol-menu_${label}`, state);
         }
 
-        // Function to set the states of all toggle buttons
         function setToggleStates() {
-            var toggleButtons = document.querySelectorAll(
-                ".floating-menu button"
-            );
-            toggleButtons.forEach(function (toggleButton) {
-                var label = toggleButton.innerHTML;
-                var state = localStorage.getItem(`qol-menu_${label}`) || "on"; // Retrieve from localStorage or default to "on"
-                toggleButton.classList.remove("on", "off");
-                toggleButton.classList.add(state);
-                localStorage.setItem(`qol-menu_${label}`, state); // Store the current toggle state in localStorage
+            FEATURE_TOGGLES.filter(f => !f.hidden).forEach((feature) => {
+                updateToggleButton(feature.label, featureManager.getState(feature.label));
             });
         }
 
-        // Function to toggle the state of a toggle button
-        function toggleState(label) {
-            var toggleButton = getToggleButtonByLabel(label);
-            if (toggleButton) {
-                if (toggleButton.classList.contains("on")) {
-                    setToggleState(label, "off");
-                } else {
-                    setToggleState(label, "on");
-                }
-            }
-        }
-
-        // Function to get the toggle button by label
-        function getToggleButtonByLabel(label) {
-            var toggleButtons = document.querySelectorAll(
-                ".floating-menu button"
-            );
-            for (var i = 0; i < toggleButtons.length; i++) {
-                if (toggleButtons[i].innerHTML === label) {
-                    return toggleButtons[i];
-                }
-            }
-            return null; // Button not found
+        function getToggleInputByLabel(label) {
+            var inputId = "toggle-" + label.replace(/\s+/g, "-").toLowerCase();
+            return document.getElementById(inputId);
         }
     }
-    runWhenReady("#map_canvas", createMenu);
+    if (IS_MYWCOM) {
+        runWhenReady("#map_canvas", createMenu);
+    }
 
     function isToggleButtonOn(label) {
-        // Retrieve the toggle buttons
-        var toggleButtons = document.querySelectorAll(".floating-menu button");
-
-        // Find the specific toggle button by label value
-        var toggleButton = Array.from(toggleButtons).find(function (button) {
-            return button.innerHTML === label;
-        });
-
-        // Check the status of the toggle button
-        if (toggleButton.classList.contains("on")) {
-            // The toggle button is in the "On" state
-            return true;
-        }
-
-        // The toggle button is in the "Off" state or not found
-        return false;
+        return featureManager.isEnabled(label);
     }
 
-    // What: auto login
-    // Why:  stupid question
-    if (window.location.href.indexOf("/login") != -1) {
-        if (isToggleButtonOn("Auto Login")) {
-            console.log("Login page found. Redirecting..");
-            window.location.href = window.location.href.replace(
-                "/login",
-                "/auth/sso/myw_oidc_auth_engine"
-            ); // using replace maintains sub domains
+    function handleAutoLogin() {
+        if (window.location.href.indexOf("/login") != -1) {
+            if (isToggleButtonOn("Auto Login")) {
+                console.log("Login page found. Redirecting..");
+                window.location.href = window.location.href.replace(
+                    "/login",
+                    "/auth/sso/myw_oidc_auth_engine"
+                ); // using replace maintains sub domains
+            }
+        }
+    }
+
+    function runConfigEnhancements() {
+        // Placeholder for /config-specific tweaks
+        console.info("[userscript] /config enhancements not yet implemented");
+    }
+
+    // Admin notifications poller (for /mywcom)
+    let notificationsTimer = null;
+    function startNotificationsPoll() {
+        if (notificationsTimer) return;
+        const tick = async () => {
+            try {
+                await window.myw?.app?.plugins?.adminNotifications?.showNewNotifications?.();
+            } catch (err) {
+                // silently ignore errors if plugin is unavailable
+            }
+        };
+        tick();
+        notificationsTimer = setInterval(tick, NOTIFICATION_POLL_MS);
+    }
+    function stopNotificationsPoll() {
+        if (notificationsTimer) {
+            clearInterval(notificationsTimer);
+            notificationsTimer = null;
         }
     }
 
@@ -263,66 +475,150 @@ function runWhenReady(readySelector, callback) {
     //     }
     // );
 
-    // Intercept XHR requests (dynamic content workaround)
+    // Intercept XHR/fetch requests (dynamic content workaround)
     const oldXHR = window.XMLHttpRequest.prototype.open;
+    let xhrInterceptEnabled = false;
+    let xhrInterceptUsers = 0;
+    let interceptPaused = 0;
+
+    function enableXhrIntercept() {
+        xhrInterceptUsers++;
+        xhrInterceptEnabled = xhrInterceptUsers > 0;
+    }
+
+    function disableXhrIntercept() {
+        xhrInterceptUsers = Math.max(0, xhrInterceptUsers - 1);
+        xhrInterceptEnabled = xhrInterceptUsers > 0;
+    }
+
+    function withInterceptPaused(fn) {
+        interceptPaused++;
+        let result;
+        let isPromise = false;
+        try {
+            result = fn();
+            isPromise =
+                result && typeof result.then === "function" && typeof result.finally === "function";
+            if (isPromise) {
+                return result.finally(() => {
+                    interceptPaused = Math.max(0, interceptPaused - 1);
+                });
+            }
+            return result;
+        } finally {
+            if (!isPromise) {
+                interceptPaused = Math.max(0, interceptPaused - 1);
+            }
+        }
+    }
+
+    function handleInterceptedResponse(url, responseText) {
+        let match = null;
+
+        // Limit to same origin and skip when paused
+        if (interceptPaused > 0) {
+            return;
+        }
+        let normalizedUrl;
+        try {
+            normalizedUrl = new URL(url, window.location.origin);
+            if (normalizedUrl.hostname !== window.location.hostname) {
+                return;
+            }
+        } catch {
+            return;
+        }
+
+        try {
+            // Check URL for manhole (UUB) structure
+            match = normalizedUrl.pathname.match(/\/structure\/manhole\/(\d+)\/contents/);
+            if (match && featureManager.isEnabled("Design Changes")) {
+                withInterceptPaused(() => featurePendingSpliceChanges.processManholeData(url));
+                return;
+            }
+
+            // Check URL for route contents
+            const regexRouteContents = /\/modules\/comms\/route\/.*\/(\d+)\/contents/;
+            match = normalizedUrl.pathname.match(regexRouteContents);
+            if (match && featureManager.isEnabled("Auto Terminations")) {
+                try {
+                    withInterceptPaused(() => {
+                        const data = JSON.parse(responseText);
+                        if (data) {
+                            featureBetterTerminations.getRouteSegments(data);
+                        }
+                    });
+                } catch (error) {
+                    console.error(error);
+                }
+                return;
+            }
+
+            // Check URL for segment terminations (user clicked to run manually)
+            const regexSegmentTerms = /\/modules\/comms\/fiber\/paths\/(mywcom_fiber_segment\/\d+)/;
+            match = normalizedUrl.pathname.match(regexSegmentTerms);
+            if (match && featureManager.isEnabled("Auto Terminations")) {
+                withInterceptPaused(() => {
+                    const segment = match[1];
+                    const data = JSON.parse(responseText);
+                    featureBetterTerminations.getSegment({ segment: segment, interceptedData: data }, true);
+                });
+                return;
+            }
+        } catch (error) {
+            console.error(error);
+        }
+    }
+
     function createXhrListener(url) {
         return function () {
             // Continue only if request is complete
             if (this.readyState !== 4) {
                 return;
             }
-            let match = null;
-
-            try {
-                // Check URL for manhole (UUB) structure
-                match = this.responseURL.match(/\/feature\/manhole\/(\d+)/);
-                if (match) {
-                    // const manholeId = match[1];
-                    // console.log(`UUB ${manholeId} selected`);
-                    featurePendingSpliceChanges.processManholeData(this.responseURL);
-                    return;
-                }
-
-                // Check URL for route contents
-                const regexRouteContents = /\/modules\/comms\/route\/.*\/(\d+)\/contents/;
-                match = this.responseURL.match(regexRouteContents);
-                if (match) {
-                    const routetId = match[1];
-                    // console.log(`Route ${routetId} selected`);
-                    try {
-                        const data = JSON.parse(this.responseText);
-                        if (data) {
-                            featureBetterTerminations.getRouteSegments(data);
-                        }   
-                    } catch (error) {
-                        throw console.error(error);
-                    }
-                    return;
-                }
-
-                // Check URL for segment terminations (user clicked to run manually)
-                const regexSegmentTerms = /\/modules\/comms\/fiber\/paths\/(mywcom_fiber_segment\/\d+)/;
-                match = this.responseURL.match(regexSegmentTerms);
-                if (match) {
-                    const segment = match[1];
-                    const data = JSON.parse(this.responseText);
-                    featureBetterTerminations.getSegment({segment: segment, interceptedData: data}, true);
-                    return;
-                }
-            } catch (error) {
-                throw console.error(error);
+            if (!xhrInterceptEnabled || interceptPaused > 0) {
+                return;
             }
+            // Skip non-successful responses (e.g., 500 error pages with HTML)
+            if (this.status !== 200) {
+                return;
+            }
+            handleInterceptedResponse(this.responseURL, this.responseText);
         };
     }
 
-    window.XMLHttpRequest.prototype.open = function (method, url, async) {
-        if (this.xhrListener) {
-            this.removeEventListener("readystatechange", this.xhrListener);
-        }
-        oldXHR.apply(this, arguments);
-        this.xhrListener = createXhrListener(url);
-        this.addEventListener("readystatechange", this.xhrListener);
-    };
+    if (IS_MYWCOM) {
+        window.XMLHttpRequest.prototype.open = function (method, url, async) {
+            if (this.xhrListener) {
+                this.removeEventListener("readystatechange", this.xhrListener);
+            }
+            oldXHR.apply(this, arguments);
+            if (xhrInterceptEnabled && interceptPaused === 0) {
+                this.xhrListener = createXhrListener(url);
+                this.addEventListener("readystatechange", this.xhrListener);
+            }
+        };
+
+        // Fetch interception to catch additional requests not using XHR
+        const origFetchIntercept = window.fetch;
+        window.fetch = function (...args) {
+            return origFetchIntercept.apply(this, args).then((res) => {
+                // Skip non-successful responses (e.g., 500 error pages with HTML)
+                if (xhrInterceptEnabled && interceptPaused === 0 && res.ok) {
+                    const url = res?.url || args[0];
+                    res.clone()
+                        .text()
+                        .then((text) => {
+                            handleInterceptedResponse(url, text);
+                        })
+                        .catch(() => {
+                            /* ignore parse errors */
+                        });
+                }
+                return res;
+            });
+        };
+    }
 
     // Feature - Pending Splice Changes
     // What: indicate splice changes of current design
@@ -332,6 +628,7 @@ function runWhenReady(readySelector, callback) {
     //       Click event listener to update style of pending splices when splice list is toggled
     let jsonData = {};
     let changedFeatures = [];
+    let currentDeltaId = null;
     var featurePendingSpliceChanges = (function() {
         var observer = new MutationObserver(function (mutations) {
             // The callback will be filled in later
@@ -362,24 +659,31 @@ function runWhenReady(readySelector, callback) {
     
         async function processManholeData(url) {
             try {
-                // Note: Removing delta value from URL allows us to obtain changes of currently open design
-                const newURL = url.replace(/&?delta=.*/, "");
-
-                // const response = await fetch(`/modules/comms/structure/manhole/${manholeId}/contents?delta=&include_proposed=true&application=mywcom&lang=en-US`, {
-                const response = await fetch(newURL);
-                const data = await response.json();
-                jsonData = data;
-    
                 const currentDeltaEl = document.querySelector("div.delta-owner-map-watermark-text");
                 if (!currentDeltaEl) {
                     return;
                 }
-    
+
+                // Note: Removing delta value from URL allows us to obtain changes of currently open design.
+                // If the structure only exists in the proposed delta, the base URL will 404; fall back to the original URL.
+                const baseURL = url.replace(/&?delta=.*/, "");
+                let response = await fetch(baseURL);
+                if (response.status === 404) {
+                    response = await fetch(url);
+                }
+                if (!response.ok) {
+                    return;
+                }
+
+                const data = await response.json();
+                jsonData = data;
+
                 const currentDelta = currentDeltaEl.textContent.split(": ")[1];
-                const changedFeatures = data.conns.features.filter((feature) => {
+                changedFeatures = data?.conns?.features.filter((feature) => {
                     const featureDelta = feature.myw?.delta?.split("/")[1];
                     return feature.myw && featureDelta === currentDelta;
                 });
+                currentDeltaId = currentDelta;
     
                 if (!Array.isArray(changedFeatures) || !changedFeatures.length) {
                     return;
@@ -398,7 +702,7 @@ function runWhenReady(readySelector, callback) {
                         spliceCountMap.set(id, spliceCount);
                     }
                 });
-    
+
                 setupMutationObserver(spliceCountMap);
     
             } catch (error) {
@@ -413,69 +717,123 @@ function runWhenReady(readySelector, callback) {
     })();
 
     // todo: use mutation observer instead
-    $("#myWorldApp").on("click", 'div[id="related-equipment-tree-container"] i[class="jstree-icon jstree-ocl"]', function () {
-        if (!isToggleButtonOn("Splice Changes")) {
-            return;
-        }
+    if (IS_MYWCOM) {
+        $("#myWorldApp").on("click", 'div[id="related-equipment-tree-container"] i[class="jstree-icon jstree-ocl"]', function () {
+            // if (!isToggleButtonOn("Design Changes")) {
+            //     return;
+            // }
 
-        // Fix alignment issue created by adding border to white color symbol
-        $("div[class='fiberColorSymbol']:contains(WT)").css("width", "11px");
-        $("div[class='fiberColorSymbol']:contains(WT)").css("padding", "0 3px");
+            // Fix alignment issue created by adding border to white color symbol
+            $("div[class='fiberColorSymbol']:contains(WT)").css("width", "11px");
+            $("div[class='fiberColorSymbol']:contains(WT)").css("padding", "0 3px");
 
-        if (!Array.isArray(changedFeatures) || !changedFeatures.length) {
-            return;
-        }
-
-        // Loop through pending splice changes
-        changedFeatures.forEach((feature) => {
-            const { housing, in_object, out_object, in_low, in_high, out_low, out_high } = feature.properties;
-            const id = `${housing}_${in_object}_${out_object}`;
-            const spliceGroup = document.querySelectorAll(`a[id^="${id}"]`);
-            if (!spliceGroup.length) {
+            if (!Array.isArray(changedFeatures) || !changedFeatures.length || !currentDeltaId) {
                 return;
             }
-            const spliceList = spliceGroup[0].nextSibling;
-            if (!spliceList) {
-                return;
-            }
-            const splices = spliceList.querySelectorAll("a.jstree-anchor");
-            if (!splices.length) {
-                return;
-            }
-            const regex = /(\d+).*:(\d+)/;
 
-            splices.forEach((splice) => {
-                // Skip elements that have already been modified
-                if (splice.dataset.qol) {
+            // Loop through pending splice changes
+            changedFeatures.forEach((feature) => {
+                const { housing, in_object, out_object, in_low, in_high, out_low, out_high } = feature.properties;
+                const id = `${housing}_${in_object}_${out_object}`;
+                const spliceGroup = document.querySelectorAll(`a[id^="${id}"]`);
+                if (!spliceGroup.length) {
                     return;
                 }
+                const spliceList = spliceGroup[0].nextSibling;
+                if (!spliceList) {
+                    return;
+                }
+                const splices = spliceList.querySelectorAll("a.jstree-anchor");
+                if (!splices.length) {
+                    return;
+                }
+                const regex = /(\d+).*:(\d+)/;
+                let maxMainWidth = 0;
 
-                const matches = splice.textContent.match(regex);
-                if (matches && matches.length === 3) {
-                    const strandIn = parseInt(matches[1]);
-                    const strandOut = parseInt(matches[2]);
-                    const matchIn =
-                        strandIn >= in_low && strandIn <= in_high;
-                    const matchOut =
-                        strandOut >= out_low && strandOut <= out_high;
-                    if (matchIn && matchOut) {
-                        // Change text color to indicate pending change
-                        splice.style.color = "#20b94b";
-
-                        // Add element showing the design name
-                        splice.insertAdjacentHTML(
-                            "beforeend",
-                            `<span class="design-link" style="color: #20b94b;"> [Design: ${currentDelta}] </span>`
-                        );
-
-                        // Mark element so it's only processed once
-                        splice.dataset.qol = true;
+                splices.forEach((splice) => {
+                    // Normalize layout wrapper for all splices (pending or not)
+                    if (!splice.querySelector(".qol-splice-row")) {
+                        const row = document.createElement("span");
+                        row.className = "qol-splice-row";
+                        while (splice.firstChild) {
+                            row.appendChild(splice.firstChild);
+                        }
+                        splice.appendChild(row);
                     }
+                    const row = splice.querySelector(".qol-splice-row");
+
+                    // Split into main (left/middle) and right wrappers for alignment
+                    let rightWrap = row.querySelector(".qol-splice-right");
+                    let mainWrap = row.querySelector(".qol-splice-main");
+                    if (!mainWrap) {
+                        mainWrap = document.createElement("span");
+                        mainWrap.className = "qol-splice-main";
+                        // Move all existing children into main for now
+                        while (row.firstChild) {
+                            mainWrap.appendChild(row.firstChild);
+                        }
+                        row.appendChild(mainWrap);
+                    }
+                    if (!rightWrap) {
+                        rightWrap = document.createElement("span");
+                        rightWrap.className = "qol-splice-right";
+                        row.appendChild(rightWrap);
+                    }
+
+                    // Move right-side pieces into rightWrap
+                    const fiberTo = mainWrap.querySelector(".fiber-colors.to");
+                    if (fiberTo) {
+                        rightWrap.appendChild(fiberTo);
+                    }
+                    const designLinkExisting = mainWrap.querySelector(".design-link");
+                    if (designLinkExisting) {
+                        rightWrap.appendChild(designLinkExisting);
+                    }
+
+                    // Track the widest main section for this splice list
+                    const mainWidth = mainWrap.getBoundingClientRect().width;
+                    if (mainWidth > maxMainWidth) {
+                        maxMainWidth = mainWidth;
+                    }
+
+                    // Skip elements that have already been modified
+                    if (splice.dataset.qol) {
+                        return;
+                    }
+
+                    const matches = splice.textContent.match(regex);
+                    if (matches && matches.length === 3) {
+                        const strandIn = parseInt(matches[1]);
+                        const strandOut = parseInt(matches[2]);
+                        const matchIn =
+                            strandIn >= in_low && strandIn <= in_high;
+                        const matchOut =
+                            strandOut >= out_low && strandOut <= out_high;
+                        if (matchIn && matchOut) {
+                            // Change text color to indicate pending change
+                            row.style.color = "#20b94b";
+
+                            // Add element showing the design name
+                            if (!row.querySelector(".design-link")) {
+                                const designLink = document.createElement("span");
+                                designLink.className = "design-link";
+                                designLink.textContent = `[Design: ${currentDeltaId}]`;
+                                rightWrap.appendChild(designLink);
+                            }
+
+                            // Mark element so it's only processed once
+                            splice.dataset.qol = true;
+                        }
+                    }
+                });
+
+                // Apply a consistent main-column width for this splice list to align right-side elements
+                if (maxMainWidth > 0) {
+                    spliceList.style.setProperty("--qol-splice-main", `${Math.ceil(maxMainWidth)}px`);
                 }
             });
         });
     }
-    );
 
     // Feature - Details Popup
     var featureDetailsPopup = (function () {
@@ -718,6 +1076,18 @@ function runWhenReady(readySelector, callback) {
 
             observe: function() {
                 observer.observe(document, { childList: true, subtree: true });
+            },
+
+            stop: function() {
+                observer.disconnect();
+                const existingBtn = document.querySelector(".qol-popup-li");
+                if (existingBtn) {
+                    existingBtn.remove();
+                }
+                const popup = document.querySelector(".qol-popup-box");
+                if (popup) {
+                    popup.remove();
+                }
             }
         };
     })();
@@ -981,6 +1351,18 @@ function runWhenReady(readySelector, callback) {
 
             observe: function() {
                 observer.observe(document, { childList: true, subtree: true });
+            },
+
+            stop: function() {
+                observer.disconnect();
+                const existingBtn = document.querySelector(".qol-calc-li");
+                if (existingBtn) {
+                    existingBtn.remove();
+                }
+                const overlay = document.querySelector(".qol-calc-overlay");
+                if (overlay) {
+                    overlay.remove();
+                }
             }
         };
     })();
@@ -1347,17 +1729,29 @@ function runWhenReady(readySelector, callback) {
             observe: function () {
                 observer.observe(document, { childList: true, subtree: true });
             },
+
+            stop: function () {
+                observer.disconnect();
+                const btn = document.querySelector('.qol-better-splice-btn');
+                if (btn) {
+                    btn.remove();
+                }
+            },
         };
     })();
 
-    // Feature - Better Terminations (local storage caching, hover details appended to strand list)
+    // Feature - Auto Terminations (local storage caching, hover details appended to strand list)
     var featureBetterTerminations = (function() {
-        console.log("Running - Auto Terminations")
+        const FEATURE_NAME = 'Terminations';
+        logger.info(FEATURE_NAME, "Running - Auto Terminations");
 
         const COMPANY_URL = `https://${window.location.hostname}`;
         const PORT = 'port';
         const FIBER_PATCH_PANEL = 'fiber_patch_panel';
         const FIBER_ONT = 'fiber_ont';
+        const TERMINATION_BATCH_SIZE = 12;
+        const TERMINATION_TIMEOUT_MS = 30000;
+        const TERMINATION_MAX_CONCURRENCY = 3;
         const FEATURE_PROPERTIES = {
             'fiber_patch_panel': ['id', 'name', 'n_fiber_ports', 'root_housing'],
             'fiber_splitter': ['id', 'name', 'n_fiber_out_ports', 'device_id'],
@@ -1378,169 +1772,338 @@ function runWhenReady(readySelector, callback) {
         };
 
         let forceRefresh = false;
+        let termMutationObserver = null;
+        const displayRetryCounts = new Map();
+        let cableTreePatched = false;
+        let cableTreeShowPatched = false;
+        const segmentBatchState = new Map(); // segment -> { strands: [], saved: number, fiberCount: number }
 
         // Cleanup stale cache data
         Object.entries(localStorage).forEach(([k, v]) => {
             if (k.includes("state")) return;
             if (v.includes("saved") && v.includes("data")) {
-                // console.log(`${k} length before: ${Object.keys(JSON.parse(localStorage[k])).length}`);
                 purgeFeatureCache(k, 5);
-                // console.log(`${k} length after: ${Object.keys(JSON.parse(localStorage[k])).length}`);
             }
         });
 
-        function showTerminations(segment, strands, savedTimestamp) {
-            console.log('showTerminations:', segment);
+        function findSegmentAnchor(segment) {
+            // IDs contain slashes; use getElementById instead of querySelector
+            const candidates = [
+                `out_${segment}_anchor`,
+                `in_${segment}_anchor`,
+                `${segment}_anchor`
+            ];
+            for (const id of candidates) {
+                const el = document.getElementById(id);
+                if (el) return el;
+            }
+            return null;
+        }
 
-            try { // todo: improve try catch to not blanket cover entire function
+        function isSegmentExpanded(segment) {
+            const anchor = findSegmentAnchor(segment);
+            return !!(anchor && anchor.getAttribute('aria-expanded') === 'true');
+        }
 
+        let renderSequence = 0;
+
+        function indexStrandAnchors(liElement) {
+            // Map strand pin -> anchor element (tolerant of injected rows)
+            const anchors = {};
+            const leafAnchors = liElement ? liElement.querySelectorAll('li.jstree-leaf > a.jstree-anchor') : [];
+            if (!leafAnchors.length) return anchors;
+
+            const extractTextPin = (node) => {
+                const clone = node.cloneNode(true);
+                clone.querySelectorAll('.qol-term-row, .qol-status-message').forEach((n) => n.remove());
+                const text = (clone.textContent || '').trim();
+                const match = text.match(/(?:^|\s)(\d+)\s*(?:-|$)/);
+                return match ? parseInt(match[1], 10) : NaN;
+            };
+
+            leafAnchors.forEach((a) => {
+                const pin = extractTextPin(a);
+                if (!Number.isNaN(pin)) {
+                    anchors[pin] = a;
+                }
+            });
+            
+            logger.debug(FEATURE_NAME, 'indexStrandAnchors', {
+                li: liElement?.id,
+                leafAnchors: leafAnchors.length,
+                pins: Object.keys(anchors)
+            });
+            return anchors;
+        }
+
+        function ensureBaselineAnchor(anchor) {
+            if (!anchor) return;
+            // Only capture baseline if not already captured
+            if (anchor.dataset.qolOriginalHtml) return;
+            const clone = anchor.cloneNode(true);
+            clone.querySelectorAll('.qol-term-row, .qol-status-message').forEach((n) => n.remove());
+            anchor.dataset.qolOriginalHtml = clone.innerHTML;
+        }
+
+        function resetStrandAnchor(anchor) {
+            if (!anchor) return;
+            // Restore from baseline (don't re-capture, that would overwrite with modified state)
+            anchor.innerHTML = anchor.dataset.qolOriginalHtml || '';
+            anchor.classList.remove('qol-term');
+            anchor.querySelectorAll('.qol-status-message').forEach((n) => n.remove());
+        }
+
+        function resetSegmentAnchors(liElement) {
+            if (!liElement) return;
+            liElement.querySelectorAll('li.jstree-leaf > a').forEach(resetStrandAnchor);
+            liElement.querySelectorAll('.qol-status-message').forEach((n) => n.remove());
+        }
+
+        async function showTerminations(segment, strands) {
+            // Don't render if feature is disabled
+            if (!featureManager.isEnabled("Auto Terminations")) {
+                return;
+            }
+            
+            const seq = ++renderSequence;
+            logger.log(FEATURE_NAME, 'showTerminations seq', seq, 'segment:', segment, 'strands len:', strands?.length);
+            try {
                 if (!Array.isArray(strands)) {
-                    console.error("Invalid data: strands is not an array");
-                    console.error(strands);
+                    logger.error(FEATURE_NAME, "Invalid data: strands is not an array", strands);
                     return;
                 }
-
+                
+                // Filter out undefined/null values from sparse array
+                const validStrands = strands.filter(Boolean);
+                if (!validStrands.length) {
+                    logger.debug(FEATURE_NAME, "No valid strands to display for segment:", segment);
+                    return;
+                }
+                
+                const anchor = findSegmentAnchor(segment);
+                if (!anchor || anchor.getAttribute('aria-expanded') !== 'true') {
+                    return;
+                }
                 const liElement = document.getElementById(`out_${segment}`) || document.getElementById(`in_${segment}`) || document.getElementById(segment);
                 if (!liElement) {
-                    console.error('Segment DOM element not found for:', segment);
+                    const count = displayRetryCounts.get(segment) || 0;
+                    if (count < 5) {
+                        displayRetryCounts.set(segment, count + 1);
+                        setTimeout(() => showTerminations(segment, strands), 250 * (count + 1));
+                    }
                     return;
                 }
-                const strandElements = liElement.querySelectorAll('a');
-                if (!strandElements) {
-                    console.error('Strand DOM elements not found for:', segment);
+                displayRetryCounts.delete(segment);
+                const strandAnchorIndex = indexStrandAnchors(liElement);
+                if (!Object.keys(strandAnchorIndex).length) {
+                    const key = `${segment}::anchors`;
+                    const count = displayRetryCounts.get(key) || 0;
+                    if (count < 5) {
+                        displayRetryCounts.set(key, count + 1);
+                        setTimeout(() => showTerminations(segment, strands), 250 * (count + 1));
+                        logger.debug(FEATURE_NAME, 'anchors not ready, retry', { segment, attempt: count + 1 });
+                    } else {
+                        logger.error(FEATURE_NAME, 'Strand DOM elements not found after retries:', segment);
+                        displayRetryCounts.delete(key); // Clean up
+                    }
                     return;
                 }
-
-                // Determine which side should be the in and out (more consistent list when panels are lined up on the left side)
+                displayRetryCounts.delete(`${segment}::anchors`);
+                // Reset only pins we are about to render; avoid clearing unrelated pins during batch updates
                 let inCount = 0, outCount = 0;
-                let maxCell1Width = 0;
-                strands.forEach((strand, index) => {
-                    if (strand.in.feature.startsWith(FIBER_PATCH_PANEL)) {
-                        inCount++;
-                    }
-                    if (strand.out.feature.startsWith(FIBER_PATCH_PANEL)) {
-                        outCount++;
-                    }
-
-                    // Calculate strandElements max width value
-                    const strandElement = strandElements[index + 1]; // strand elements start index 1
-                    const cell1Width = strandElement.clientWidth || 100; // 100 is approx. width of unspliced 2-digit strand
-                    if (cell1Width > maxCell1Width) {
-                        maxCell1Width = cell1Width;
-                    }
+                validStrands.forEach((strand) => {
+                    if (strand.in.feature.startsWith(FIBER_PATCH_PANEL)) inCount++;
+                    if (strand.out.feature.startsWith(FIBER_PATCH_PANEL)) outCount++;
                 });
-
-                displayStatusMessage(segment, 'Processing...');
-                strands.forEach(async (strand, index) => {
-                    // displayStatusMessage(segment, `Processing... Strand ${index}`);
-
-                    const strandElement = strandElements[index + 1]; // Get the corresponding strand element, starting from the second element
-                    // if (strandElement.classList.contains('qol-term')) {
-                    //     console.log('test?');
-                    //     return;
-                    // }
-            
+                for (const strand of validStrands) {
+                    const pin = parseInt(strand.pin, 10);
+                    const strandElement = strandAnchorIndex[pin];
+                    if (!strandElement) {
+                        logger.warn(FEATURE_NAME, `no strand anchor for pin ${pin} in ${segment}`, {
+                            seq,
+                            pinsAvailable: Object.keys(strandAnchorIndex),
+                            strand
+                        });
+                        continue;
+                    }
+                    ensureBaselineAnchor(strandElement);
+                    strandElement.querySelectorAll('.qol-term-row').forEach((n) => n.remove());
+                    const baselineHtml = strandElement.dataset.qolOriginalHtml || '';
+                    // Render baseline temporarily to measure width, then clear to avoid duplicate baseline rows
+                    strandElement.innerHTML = baselineHtml;
+                    const cell1Width = Math.max(strandElement.getBoundingClientRect?.().width || 0, strandElement.clientWidth || 0, 100);
+                    strandElement.innerHTML = '';
+                    strandElement.querySelectorAll('.qol-status-message').forEach((el) => el.remove());
+                    strandElement.classList.remove('qol-term');
                     let inSide, outSide;
                     if (inCount > outCount) {
                         [inSide, outSide] = [strand.in, strand.out];
                     } else {
                         [inSide, outSide] = [strand.out, strand.in];
                     }
+                    const [popIn, popOut] = await Promise.all([populateSideInfo(inSide), populateSideInfo(outSide)]);
+                    const inElement = formatText(popIn);
+                    const outElement = formatText(popOut);
+                    const openingP = document.createTextNode(' (');
+                    const closingP = document.createTextNode(')');
+                    const arrowElement = document.createElement('span');
+                    arrowElement.textContent = ' ➡ ';
+                    
+                    const wrappedElement = document.createElement('span');
+                    wrappedElement.append(openingP, inElement, arrowElement, outElement, closingP);
 
-                    // Only show terminations with ports
-                    // if (!inSide.type.startsWith(PORT) || !outSide.type.startsWith(PORT)) {
-                        // todo: when termination is a segment, use getSegment to get in_structure and out_structure.
-                        // check in_structure and out_structure to determine which is the most likely termination point
-
-                        // response.myw.title for structure name: ${COMPANY_URL}/feature/${structure}?display_values=true&include_lobs=true&include_geo_geometry=true&svars=%7B%22activeDelta%22%3A%22%22%7D&delta=&application=mywcom&lang=en-US
-                        // response.cables.count for comparison criteria? : ${COMPANY_URL}/modules/comms/structure/${structure}/contents?delta=&include_proposed=true&application=mywcom&lang=en-US
-
-                    // }
-
-                    // Change the icon
-                    const iconElement = strandElement.querySelector('.jstree-icon');
+                    const row = document.createElement('div');
+                    row.classList.add('qol-term-row');
+                    row.style.display = 'flex';
+                    row.style.justifyContent = 'space-between';
+                    row.dataset.qolPin = pin;
+                    const cell1 = document.createElement('div');
+                    cell1.classList.add('qol-term-cell', 'qol-term-cell1');
+                    cell1.style.width = `${cell1Width + 5}px`;
+                    cell1.innerHTML = baselineHtml;
+                    const iconElement = cell1.querySelector('.jstree-icon');
                     if (iconElement && iconElement.style.backgroundImage.includes('features/fiber.svg')) {
                         iconElement.style.backgroundImage = `url("${determineIcon(inSide.type, outSide.type)}")`;
                     }
-
-                    // Populate the side info
-                    inSide = await populateSideInfo(inSide);
-                    outSide = await populateSideInfo(outSide);
-            
-                    const inElement = formatText(inSide);
-                    const outElement = formatText(outSide);
-            
-                    const arrowElement = document.createElement('span');
-                    arrowElement.textContent = ' ➡ ';
-            
-                    const wrappedElement = document.createElement('span');
-                    const openingP = document.createTextNode(' (');
-                    const closingP = document.createTextNode(')');
-            
-                    wrappedElement.append(openingP, inElement, arrowElement, outElement, closingP);
-            
-                    const row = document.createElement('div');
-                    row.style.display = 'flex';
-                    row.style.justifyContent = 'space-between';
-
-                    const cell1 = document.createElement('div');
-                    cell1.style.width = `${maxCell1Width + 5}px`;
-                    while (strandElement.firstChild) {
-                        cell1.appendChild(strandElement.firstChild); // Moves the existing content of the anchor tag to cell1
-                    }
                     row.appendChild(cell1);
-
                     const cell2 = document.createElement('div');
+                    cell2.classList.add('qol-term-cell', 'qol-term-cell2');
                     cell2.appendChild(wrappedElement);
                     row.appendChild(cell2);
-
-                    strandElement.appendChild(row);  // append the row to the element
+                    strandElement.appendChild(row);
                     strandElement.classList.add('qol-term');
-                });
-
-                displayStatusMessage(segment, null, savedTimestamp);
-
+                    const dupCells = strandElement.querySelectorAll('.qol-term-cell2').length;
+                    if (dupCells > 1) {
+                        logger.debug(FEATURE_NAME, 'multiple term cells after inject', { segment, pin, dupCells, seq });
+                    }
+                }
             } catch (error) {
-                displayStatusMessage(segment, 'Unable to complete');
-                console.error(`Unable to show terminations for ${segment}`);
-                console.error(error);
+                logger.error(FEATURE_NAME, `Unable to show terminations for ${segment}`, error);
             }
         }
-
+        
         function displayStatusMessage(segment, message, savedTimestamp = '') {
-            const liElement = document.getElementById(`out_${segment}`) || document.getElementById(`in_${segment}`) || document.getElementById(segment);
-            if (!liElement) {
-                console.error('Segment DOM element not found for:', segment);
+            // Only show status when the segment anchor is open
+            if (!isSegmentExpanded(segment)) {
                 return;
             }
-        
+
+            const liElement = document.getElementById(`out_${segment}`) || document.getElementById(`in_${segment}`) || document.getElementById(segment);
+            if (!liElement) {
+                // Tree/segment not in DOM yet; skip status update quietly
+                return;
+            }
+
             try {
-                const strandElements = liElement.querySelectorAll('a');
-                const firstStrandElement = strandElements[0];
-            
-                let statusElement = firstStrandElement.querySelector('.qol-status-message');
-            
+                // Prefer the segment anchor; fall back to any anchor inside the li
+                const anchor = findSegmentAnchor(segment) || liElement.querySelector('a');
+                if (!anchor) {
+                    return;
+                }
+
+                let statusElement = anchor.querySelector('.qol-status-message');
+
                 if (!statusElement) {
                     statusElement = document.createElement('span');
                     statusElement.classList.add('qol-status-message');
                     statusElement.style.paddingLeft = '10px';
                     statusElement.style.color = iqgeoGreen;
                     statusElement.style.fontSize = '13px';
-                    firstStrandElement.appendChild(statusElement);
+                    anchor.appendChild(statusElement);
                 }
-            
+
+                // Remove existing clear button if any
+                const existingClearBtn = anchor.querySelector('.qol-term-clear-btn');
+                if (existingClearBtn) {
+                    existingClearBtn.remove();
+                }
+
                 // Set the message to indicate the current status
                 if (savedTimestamp) {
                     const savedDate = new Date(savedTimestamp);
                     statusElement.textContent = `(Terminations updated: ${savedDate.toLocaleString()})`;
+                    
+                    // Add clear button for debugging
+                    const clearBtn = document.createElement('button');
+                    clearBtn.textContent = 'Clear';
+                    clearBtn.classList.add('qol-term-clear-btn');
+                    clearBtn.style.marginLeft = '8px';
+                    clearBtn.style.padding = '2px 6px';
+                    clearBtn.style.fontSize = '11px';
+                    clearBtn.style.cursor = 'pointer';
+                    clearBtn.style.backgroundColor = '#c62828';
+                    clearBtn.style.color = 'white';
+                    clearBtn.style.border = 'none';
+                    clearBtn.style.borderRadius = '3px';
+                    clearBtn.title = 'Clear cached terminations for this segment';
+                    
+                    clearBtn.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        clearSegmentTerminations(segment, liElement);
+                    });
+                    
+                    anchor.appendChild(clearBtn);
                 } else {
                     statusElement.textContent = message;
                 }
             } catch (error) {
-                console.error(`Error updating status message for segment: ${segment}`);
-                console.error(error);
+                logger.error(FEATURE_NAME, `Error updating status message for segment: ${segment}`, error);
             }
-        }        
+        }
+
+        function clearSegmentTerminations(segment, liElement) {
+            try {
+                // Clear rendered terminations from DOM
+                if (liElement) {
+                    resetSegmentAnchors(liElement);
+                }
+
+                // Clear from in-memory batch state
+                segmentBatchState.delete(segment);
+
+                // Clear from localStorage
+                const normalizedSegment = segment.replace(/out_|in_/g, '');
+                const [segmentType, segmentId] = normalizedSegment.split('/');
+                const cacheKey = segmentType;
+                const cacheItem = localStorage.getItem(cacheKey);
+                
+                if (cacheItem) {
+                    try {
+                        const cacheData = JSON.parse(cacheItem);
+                        if (cacheData[segmentId]) {
+                            delete cacheData[segmentId];
+                            if (Object.keys(cacheData).length > 0) {
+                                localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+                            } else {
+                                localStorage.removeItem(cacheKey);
+                            }
+                            logger.debug(FEATURE_NAME, `Cleared cache for ${segment}`);
+                        }
+                    } catch (e) {
+                        logger.warn(FEATURE_NAME, `Failed to parse cache for ${cacheKey}`, e);
+                    }
+                }
+
+                // Update status message
+                const anchor = findSegmentAnchor(segment);
+                if (anchor) {
+                    const statusElement = anchor.querySelector('.qol-status-message');
+                    if (statusElement) {
+                        statusElement.textContent = '(Cleared)';
+                        statusElement.style.color = '#999';
+                    }
+                    const clearBtn = anchor.querySelector('.qol-term-clear-btn');
+                    if (clearBtn) {
+                        clearBtn.remove();
+                    }
+                }
+
+                logger.info(FEATURE_NAME, `Cleared terminations for segment: ${segment}`);
+            } catch (error) {
+                logger.error(FEATURE_NAME, `Error clearing segment terminations for ${segment}`, error);
+            }
+        }
 
         function determineIcon(inType, outType) {
             // TODO: Add handling to catch icons not available (paths change in future)
@@ -1560,7 +2123,7 @@ function runWhenReady(readySelector, callback) {
                 return '';
             }
         }
-        
+
         async function populateSideInfo(side) {
             if (side.type === 'cable') {
                 const structureData = await getStructure(side);
@@ -1585,8 +2148,6 @@ function runWhenReady(readySelector, callback) {
         }
         
         function formatText(side) {
-            // console.log('formatText', side);
-
             const desc = side.desc.replace(/#.*/g, '');
             const featureType = side.feature.split('/')[1];
 
@@ -1649,15 +2210,15 @@ function runWhenReady(readySelector, callback) {
                     }
                 } else if (side.type === 'cable') {
                     featureType = side.structureData.end_structure_type;
-                    featureId = side.feature.split('/')[1];
+                    let featureId = side.feature.split('/')[1];
                     hoverText = `Segment - ${featureId}`;
                 }
                 // Get the appropriate formatter
                 const formatter = formatters[featureType] || formatters.default;
                 displayText = formatter(side);
             } catch (error) {
-                console.log('Error in formatText for Side:', side);
-                throw console.error(error);
+                logger.error(FEATURE_NAME, 'Error in formatText for Side:', side, error);
+                throw error;
             }
         
             const element = document.createElement('span');
@@ -1699,8 +2260,6 @@ function runWhenReady(readySelector, callback) {
 
             // If there's no ongoing request, start one and store it in the cache
             structureRequests[structure] = (async () => {
-                // console.log(`Getting structure: ${structure}`);
-
                 const [structureType, structureId] = structure.split('/');
                 let structureData;
                 if (!forceRefresh) {
@@ -1726,14 +2285,10 @@ function runWhenReady(readySelector, callback) {
                     } else if (in_or_out === 'out') {
                         end_structure = out_structure;
                     } else {
-                        console.error(`Couldn't determine end_structure`);
-                        throw new Error(`Couldn't determine end_structure`);
+                        const msg = `Couldn't determine end_structure`;
+                        logger.error(FEATURE_NAME, msg);
+                        throw new Error(msg);
                     }
-
-                    // No longer necessary... right?
-                    // url = `${COMPANY_URL}/modules/comms/structure/${in_structure}/contents?delta=${design}&include_proposed=true&application=mywcom&lang=en-US`;
-                    // data = await fetchData(url);
-                    // structureData['end_equip_count'] = data.equip?.count;
 
                     // Send request to get end_structure data
                     const structureURL = `${COMPANY_URL}/feature/${end_structure}?display_values=true&delta=${design}&application=mywcom&lang=en-US`;
@@ -1784,10 +2339,8 @@ function runWhenReady(readySelector, callback) {
                     // Get the list of properties to save for this featureType
                     let propertiesToSave = FEATURE_PROPERTIES[featureType];
                     if (!propertiesToSave) {
-                        console.log('feature:', feature);
-                        console.info(`Unknown feature type: ${featureType}`);
-                        
-                        // *Should* be available for most/all features
+                        logger.debug(FEATURE_NAME, 'Unknown feature type:', featureType, 'feature:', feature);
+                        // *Should* be available for all features
                         propertiesToSave = ['id', 'name'];
                     }
             
@@ -1795,7 +2348,8 @@ function runWhenReady(readySelector, callback) {
                     featureData = {};
                     for (const property of propertiesToSave) {
                         if (data?.["properties"]?.hasOwnProperty(property) === false) {
-                            throw console.error(`${feature} does not contain property: ${property}`);
+                            const msg = `${feature} does not contain property: ${property}`;
+                            logger.debug(FEATURE_NAME, msg);
                         }
                         featureData[property] = data.properties[property];
                     }
@@ -1805,9 +2359,7 @@ function runWhenReady(readySelector, callback) {
                 }
             
                 // If there is a second level feature, fetch it as well
-                // console.log('featureData:', featureData);
                 const rootHousing = featureData.root_housing;
-                // console.log('rootHousing:', rootHousing);
                 if (rootHousing && (rootHousing.startsWith('cabinet') || rootHousing.startsWith('building'))) {
                     const housingData = await getFeatureInfo(rootHousing);  // Recursion
                     return { ...featureData, housingInfo: housingData };
@@ -1823,8 +2375,6 @@ function runWhenReady(readySelector, callback) {
         }
 
         async function loadFeatureInfo(featureType, featureId) {
-            // console.log('Loading feature info:', featureType, featureId);
-            
             // Load the data for the specified featureType
             const item = localStorage.getItem(featureType);
             if (!item) {
@@ -1832,7 +2382,6 @@ function runWhenReady(readySelector, callback) {
             }
             const existingData = JSON.parse(item);
             if (!existingData[featureId]) {
-                // console.log(`Saved data not found: ${featureType} ${featureId}`);
                 return null;
             }
 
@@ -1846,8 +2395,7 @@ function runWhenReady(readySelector, callback) {
             
             const elapsedTime = currTime - savedTime;
             if (elapsedTime > maxTTL) {
-                // console.info(`Feature ${featureType}/${featureId} saved ${elapsedTime} ms ago`);
-                console.info(`Cache data for ${featureType}/${featureId} expired ${elapsedTime / dayInMs} hours ago`);
+                logger.debug(FEATURE_NAME, `Cache data for ${featureType}/${featureId} expired ${elapsedTime / dayInMs} hours ago`);
 
                 // Remove expired record from cache
                 delete existingData[featureId]; // Remove element from cached featureType data object
@@ -1861,8 +2409,6 @@ function runWhenReady(readySelector, callback) {
 
         async function saveFeatureInfo(featureType, featureId, newData) {
             try {
-                // console.log('Saving feature info:', featureType, featureId);
-
                 // Load existing data or initialize an empty object
                 let existingData = localStorage.getItem(featureType);
                 existingData = existingData ? JSON.parse(existingData) : {};
@@ -1877,14 +2423,11 @@ function runWhenReady(readySelector, callback) {
                 return existingData[featureId].data;
                 
             } catch (error) {
-                console.error(`Unable to save info for ${featureType}/${featureId}`);
-                console.error(`Error: ${error}`);
+                logger.error(FEATURE_NAME, `Unable to save info for ${featureType}/${featureId}`, error);
             }
         }
 
         function purgeFeatureCache(featureType, maxAgeDays = 5) {
-            // console.log('Cleaning up cache for:', featureType);
-            
             // Load the data for the specified featureType
             const item = localStorage.getItem(featureType);
             if (!item) return false;
@@ -1893,29 +2436,23 @@ function runWhenReady(readySelector, callback) {
             try {
                 cacheData = JSON.parse(item);
                 if (!cacheData) {
-                    console.log(`Unable to parse cache for ${featureType}`);
+                    logger.debug(FEATURE_NAME, `Unable to parse cache for ${featureType}`);
                     return false;
                 }
             } catch (error) {
-                console.log(`Unable to parse cache for ${featureType}`);
+                logger.debug(FEATURE_NAME, `Unable to parse cache for ${featureType}`);
                 return false;
             }
 
-            // console.log(`${featureType} cache size: ${Object.keys(cacheData).length}`);
+            logger.debug(FEATURE_NAME, `${featureType} cache size: ${Object.keys(cacheData).length}`);
 
             const dayInMs = 86_400_000 // 24 hours in milliseconds
             const maxTTL = maxAgeDays * dayInMs;
             const oldestSaveTime = Date.now() - maxTTL;
-            // console.log('Oldest cache save time:', oldestSaveTime);
             
-            const validEntries = Object.entries(cacheData).filter(([key, val]) => val.hasOwnProperty('saved') & val['saved'] > oldestSaveTime);
-            // console.log('Count valid:', validEntries.length);
+            const validEntries = Object.entries(cacheData).filter(([key, val]) => val.hasOwnProperty('saved') && val['saved'] > oldestSaveTime);
             const outdatedCount = Object.keys(cacheData).length - validEntries.length;
-            updatedCacheData = Object.fromEntries(validEntries); 
-            // console.log('Count outdated:', outdatedCount);
-
-            updatedCacheData = Object.fromEntries(validEntries);
-            // console.log('Updated Cache:', updatedCacheData);
+            const updatedCacheData = Object.fromEntries(validEntries);
 
             // Return early if no change is needed
             if (outdatedCount <= 0) {
@@ -1934,8 +2471,7 @@ function runWhenReady(readySelector, callback) {
                     localStorage.removeItem(featureType);
                 }
             } catch (error) {
-                console.error(`Error updating ${featureType} cache`);
-                console.error(error);
+                logger.error(FEATURE_NAME, `Error updating ${featureType} cache`, error);
                 throw error;
             }
 
@@ -1943,113 +2479,253 @@ function runWhenReady(readySelector, callback) {
             return remainingEntries;
         }
     
+        function normalizeStrands(newData) {
+            return Object.keys(newData).map((key) => {
+                const strand = newData[key];
+                const { in: inSide, out: outSide } = strand;
+    
+                const pinFromKey = parseInt(key, 10);
+                const pinFromSides = parseInt(inSide.pin || outSide.pin, 10);
+                const pin = Number.isNaN(pinFromKey) ? pinFromSides : pinFromKey;
+
+                return {
+                    pin,
+                    in: {
+                        desc: inSide.desc,
+                        feature: inSide.feature,
+                        id: inSide.id,
+                        pin: inSide.pin,
+                        side: inSide.side,
+                        title: inSide.title,
+                        type: inSide.type,
+                    },
+                    out: {
+                        desc: outSide.desc,
+                        feature: outSide.feature,
+                        id: outSide.id,
+                        pin: outSide.pin,
+                        side: outSide.side,
+                        title: outSide.title,
+                        type: outSide.type,
+                    },
+                };
+            });
+        }
+
+        function mergeBatchStrands(segment, fiberCount, batchStrands, savedTimestamp) {
+            const state = segmentBatchState.get(segment) || { strands: new Array(fiberCount), saved: savedTimestamp, fiberCount };
+            const merged = state.strands.length >= fiberCount ? state.strands : new Array(fiberCount);
+            batchStrands.forEach((strand) => {
+                const pin = Number(strand.pin);
+                const idx = Number.isFinite(pin) ? Math.max(0, pin - 1) : merged.length;
+                merged[idx] = strand;
+            });
+            segmentBatchState.set(segment, { strands: merged, saved: savedTimestamp || state.saved, fiberCount });
+            return segmentBatchState.get(segment);
+        }
+
+        async function fetchSegmentBatch({ segment, startPin, endPin, design }) {
+            const url = `${COMPANY_URL}/modules/comms/fiber/paths/${segment}?pins=in%3A${startPin}%3A${endPin}&full=false&delta=${design}&application=mywcom&lang=en-US`;
+            const data = await withInterceptPaused(() => fetchData(url, { timeoutMs: TERMINATION_TIMEOUT_MS }));
+            return data;
+        }
+
         // Cache for promises returned by getSegment
         const segmentRequests = {};
         async function getSegment({segment, cable, fiberCount, interceptedData}, forceRefreshParam = false) {
+            // Don't fetch/render if feature is disabled
+            if (!featureManager.isEnabled("Auto Terminations")) {
+                return Promise.resolve({ saved: null, data: [] });
+            }
+            
             // Check if there's an ongoing request for this segment
             if (segmentRequests[segment]) {
                 return segmentRequests[segment];
             }
 
-            // console.log(
-            //     `getSegment for 
-            //     segment: ${segment},
-            //     cable: ${cable},
-            //     fiberCount: ${fiberCount},
-            //     interceptedData: ${interceptedData}`
-            // );
-
-            displayStatusMessage(segment, "Updating Terminations...");
+            if (isSegmentExpanded(segment)) {
+                displayStatusMessage(segment, "Updating Terminations...");
+            } else {
+                // Do not start work unless expanded
+                return Promise.resolve({ saved: null, data: [] });
+            }
             
             // If there's no ongoing request, start one and store it in the cache
             segmentRequests[segment] = (async () => {
                 // Set whether to override local storage
                 forceRefresh = forceRefreshParam;
-                // console.log(`Getting segment: ${segment}, forceRefresh: ${forceRefresh}`);
-                // console.log('interceptedData:', interceptedData);
+                logger.log(FEATURE_NAME, `Getting segment: ${segment}, forceRefresh: ${forceRefresh}`);
+                if (forceRefresh) {
+                    segmentBatchState.delete(segment);
+                }
                 
                 const [segmentType, segmentId] = segment.replace(/in|out/, '').split('/');
                 let segmentData;
                 let cachedSaved = null;
+                let cached = null;
 
                 if (!forceRefresh) {
-                    const cached = await loadFeatureInfo(segmentType, segmentId);
-                    if (cached) {
-                        try {
-                            const cacheRaw = JSON.parse(localStorage.getItem(segmentType) || "{}");
-                            cachedSaved = cacheRaw?.[segmentId]?.saved || null;
-                        } catch (e) {
-                            /* ignore cache parse issues */
+                    const state = segmentBatchState.get(segment);
+                    if (state && Array.isArray(state.strands) && state.strands.length > 0) {
+                        segmentData = { saved: state.saved || Date.now(), data: state.strands.filter(Boolean) };
+                    }
+                    if (!segmentData) {
+                        cached = await loadFeatureInfo(segmentType, segmentId);
+                        if (cached) {
+                            try {
+                                const cacheRaw = JSON.parse(localStorage.getItem(segmentType) || "{}");
+                                cachedSaved = cacheRaw?.[segmentId]?.saved || null;
+                            } catch (e) {
+                                /* ignore cache parse issues */
+                            }
+                            segmentData = { saved: cachedSaved, data: cached };
+                            const cachedPins = Array.isArray(cached) ? cached.map((s) => parseInt(s.pin, 10)).filter(Number.isFinite) : [];
+                            const inferredCount = Math.max(...cachedPins, 0);
+                            segmentBatchState.set(segment, { strands: cached, saved: cachedSaved, fiberCount: inferredCount || fiberCount || 0 });
                         }
-                        segmentData = { saved: cachedSaved, data: cached };
                     }
                 }
-            
-                if (!segmentData) {
-                    const design = getCurrentDesign();
+                const design = getCurrentDesign();
 
-                    if (!fiberCount && !interceptedData) {
+                // Ensure fiberCount
+                if (!fiberCount) {
+                    const state = segmentBatchState.get(segment);
+                    if (state?.fiberCount) {
+                        fiberCount = state.fiberCount;
+                    }
+                }
+                if (!fiberCount && segmentData?.data?.length) {
+                    const pins = segmentData.data
+                        .map((s) => parseInt(s.pin, 10))
+                        .filter(Number.isFinite);
+                    fiberCount = Math.max(...pins, fiberCount || 0);
+                }
+
+                if (!fiberCount && !interceptedData) {
+                    if (cable) {
+                        const fiberCountData = await fetchData(`${COMPANY_URL}/feature/${cable}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
+                        fiberCount = fiberCountData.properties.fiber_count;
+                    } else {
+                        const segmentDataInfo = await fetchData(`${COMPANY_URL}/feature/${segment}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
+                        cable = segmentDataInfo.properties.cable;
                         if (cable) {
                             const fiberCountData = await fetchData(`${COMPANY_URL}/feature/${cable}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
                             fiberCount = fiberCountData.properties.fiber_count;
-                        } else {
-                            const segmentData = await fetchData(`${COMPANY_URL}/feature/${segment}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
-                            cable = segmentData.properties.cable;
-                            if (cable) {
-                                const fiberCountData = await fetchData(`${COMPANY_URL}/feature/${cable}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
-                                fiberCount = fiberCountData.properties.fiber_count;
-                            }
                         }
                     }
-
-                    let newData;
-                    if (!interceptedData) {
-                        newData = await fetchData(`${COMPANY_URL}/modules/comms/fiber/paths/${segment}?pins=in%3A1%3A${fiberCount}&full=false&delta=${design}&application=mywcom&lang=en-US`);
-                    } else {
-                        newData = interceptedData;
-                    }
-
-                    const strands = Object.keys(newData).map((key) => {
-                        const strand = newData[key];
-                        const { in: inSide, out: outSide } = strand;
-        
-                        // Extract properties from both in and out sides
-                        const strandDetails = {
-                            in: {
-                                desc: inSide.desc,
-                                feature: inSide.feature,
-                                id: inSide.id,
-                                pin: inSide.pin,
-                                side: inSide.side,
-                                title: inSide.title,
-                                type: inSide.type,
-                            },
-                            out: {
-                                desc: outSide.desc,
-                                feature: outSide.feature,
-                                id: outSide.id,
-                                pin: outSide.pin,
-                                side: outSide.side,
-                                title: outSide.title,
-                                type: outSide.type,
-                            },
-                        };
-        
-                        return strandDetails;
-                    });
-
-                    segmentData = {
-                        saved: Date.now(),
-                        data: strands
-                    };
-        
-                    await saveFeatureInfo(segmentType, segmentId, strands); // 2025-11-17: Changed to save 'strands' instead of 'segmentData' to fix accidentally nesting in localStorage
                 }
+
+                // Determine missing pins from current state/cache
+                const currentState = segmentBatchState.get(segment);
+                const currentStrands = currentState?.strands || segmentData?.data || [];
+                const knownPins = new Set(
+                    (currentStrands || []).map((s) => parseInt(s?.pin, 10)).filter(Number.isFinite)
+                );
+                const missingPins = [];
+                if (fiberCount) {
+                    for (let pin = 1; pin <= fiberCount; pin++) {
+                        if (!knownPins.has(pin)) {
+                            missingPins.push(pin);
+                        }
+                    }
+                }
+                logger.debug(FEATURE_NAME, 'missingPins', segment, missingPins.length ? `${missingPins[0]}-${missingPins[missingPins.length - 1]} (count ${missingPins.length})` : 'none');
+
+                // Show cached immediately
+                if (currentStrands && currentStrands.length) {
+                    const savedTs = segmentData?.saved || cachedSaved || Date.now();
+                    mergeBatchStrands(segment, fiberCount || currentStrands.length, currentStrands, savedTs);
+                    showTerminations(segment, currentStrands);
+                    displayStatusMessage(segment, null, savedTs);
+                }
+
+                // Nothing missing: finalize status and return
+                if (!missingPins.length && segmentData) {
+                    displayStatusMessage(segment, null, segmentData.saved);
+                    return segmentData;
+                }
+
+                let newData;
+                if (!interceptedData) {
+                    const baseBatchSize = Math.max(1, TERMINATION_BATCH_SIZE);
+
+                    const buildRangesFromPins = (pins, batchSize) => {
+                        const sorted = [...pins].sort((a, b) => a - b);
+                        const ranges = [];
+                        let start = null;
+                        let end = null;
+                        for (let i = 0; i < sorted.length; i++) {
+                            const pin = sorted[i];
+                            if (start === null) {
+                                start = end = pin;
+                                continue;
+                            }
+                            const nextSize = (pin - start) + 1;
+                            if (pin === end + 1 && nextSize <= batchSize) {
+                                end = pin;
+                            } else {
+                                ranges.push({ startPin: start, endPin: end });
+                                start = end = pin;
+                            }
+                        }
+                        if (start !== null) {
+                            ranges.push({ startPin: start, endPin: end });
+                        }
+                        return ranges;
+                    };
+
+                    // Recursive splitter: shrink only the failing range, not future batches
+                    const fetchRange = async (startPin, endPin) => {
+                        if (startPin > endPin) return;
+                        try {
+                            const batchData = await fetchSegmentBatch({ segment, startPin, endPin, design });
+                            const batchStrands = normalizeStrands(batchData);
+                            mergeBatchStrands(segment, fiberCount, batchStrands, Date.now());
+                            showTerminations(segment, batchStrands);
+                            logger.debug(FEATURE_NAME, `batch ${startPin}-${endPin} ok for ${segment} (seq ${renderSequence})`);
+                        } catch (err) {
+                            const size = endPin - startPin + 1;
+                            // Suppress batch split warnings; only log single strand failures
+                            if (size > 1) {
+                                const mid = Math.floor((startPin + endPin) / 2);
+                                await fetchRange(startPin, mid);
+                                await fetchRange(mid + 1, endPin);
+                            } else {
+                                logger.warn(FEATURE_NAME, `strand ${startPin} failed for ${segment}`, err);
+                            }
+                        }
+                    };
+
+                    const ranges = buildRangesFromPins(missingPins, baseBatchSize);
+
+                    // Process base ranges with limited concurrency
+                    let idx = 0;
+                    const worker = async () => {
+                        while (idx < ranges.length) {
+                            const { startPin, endPin } = ranges[idx++];
+                            await fetchRange(startPin, endPin);
+                        }
+                    };
+                    const workers = Array.from({ length: Math.min(TERMINATION_MAX_CONCURRENCY, ranges.length) }, () => worker());
+                    await Promise.allSettled(workers);
+
+                    const mergedState = segmentBatchState.get(segment);
+                    newData = mergedState ? mergedState.strands.filter(Boolean) : [];
+                } else {
+                    newData = normalizeStrands(interceptedData);
+                    mergeBatchStrands(segment, fiberCount || newData.length, newData, Date.now());
+                }
+
+                segmentData = {
+                    saved: Date.now(),
+                    data: newData
+                };
+    
+                await saveFeatureInfo(segmentType, segmentId, newData); // 2025-11-17: Changed to save 'strands' instead of 'segmentData' to fix accidentally nesting in localStorage
         
                 return segmentData;
             })().then(result => {
-                // console.log('Show Terms:', result);
-                showTerminations(segment, result.data, result.saved);
+                displayStatusMessage(segment, null, result.saved);
                 return result;
             });
 
@@ -2060,10 +2736,8 @@ function runWhenReady(readySelector, callback) {
         } // todo: rename segmentData to terminationData and move related code to separate function (getTerminations?)
         
         async function getRouteSegments(data) {
-            // console.log('Getting segments');
-
-            const segments = data.cable_segs.features;
-            const cables = data.cables.features;
+            const segments = data.cable_segs?.features;
+            const cables = data.cables?.features;
             
             const routeSegments = segments.map((routeSegment) => {
                 const segment = `mywcom_fiber_segment/${routeSegment.id}`;
@@ -2072,23 +2746,37 @@ function runWhenReady(readySelector, callback) {
                 const fiberCount = cables.find((c) => c.id == cableId)?.properties.fiber_count;
                 return { segment, cable, fiberCount };
             });
-    
-            for (const routeSegment of routeSegments) {
-                // console.log('Getting segment data:', routeSegment);
 
-                await getSegment(routeSegment);
-            }
+            // Defer fetching until the segment is expanded; listeners handle it
+            routeSegments.forEach(({ segment, cable, fiberCount }) => {
+                const anchor = findSegmentAnchor(segment);
+                if (anchor && anchor.getAttribute('aria-expanded') === 'true') {
+                    getSegment({ segment, cable, fiberCount });
+                }
+            });
+        }
+
+        function abortableTimeoutController(timeoutMs) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(`timeout_${timeoutMs}`), timeoutMs);
+            return {
+                controller,
+                clear: () => clearTimeout(timeoutId),
+            };
         }
 
         // Helper function to fetch data
-        async function fetchData(url) {
+        async function fetchData(url, { timeoutMs } = {}) {
+            const timeout = timeoutMs ? abortableTimeoutController(timeoutMs) : null;
             try {
-                const response = await fetch(url);
+                const response = await fetch(url, timeout ? { signal: timeout.controller.signal } : undefined);
                 const data = await response.json();
                 return data;
             } catch (error) {
-                console.error(`Error fetching data from ${url}:`, error);
+                logger.error(FEATURE_NAME, `Error fetching data from ${url}:`, error);
                 throw error; // Rethrow the error so it can be handled by the caller
+            } finally {
+                timeout?.clear();
             }
         }
 
@@ -2101,81 +2789,150 @@ function runWhenReady(readySelector, callback) {
             return '';
         }
     
+        function setupTreeListeners() {
+            patchCableTreeHandlers();
+            patchCableTreeShow();
+        }
+
+        function patchCableTreeHandlers() {
+            if (cableTreePatched) return true;
+            const treeViews = [
+                window.myw?.app?.plugins?.cableTree?.structCableTreeView,
+                window.myw?.app?.plugins?.cableTree?.routeTreeView
+            ].filter(Boolean);
+            if (!treeViews.length) return false;
+
+            const patchOne = (treeView, label) => {
+                if (!treeView || typeof treeView.setEventHandlers !== 'function') return;
+                const original = treeView.setEventHandlers.bind(treeView);
+                treeView.setEventHandlers = function (...args) {
+                    original(...args);
+                    try {
+                        const $tree = this.container;
+                        if (!$tree || typeof $tree.on !== 'function') return;
+                        const inst = typeof $tree.jstree === 'function' ? $tree.jstree(true) : null;
+                        if (!inst || inst === true || inst === false || typeof inst.get_node !== 'function') return;
+
+                        const renderOpenNodes = () => {
+                            const openNodes = $tree.find('li.jstree-open[id*="mywcom_fiber_segment/"]');
+                            openNodes.each((_, li) => {
+                                const node = inst.get_node(li);
+                                if (!node) return;
+                                const segment = node.id.replace(/out_|in_/g, '');
+                                let cable = null;
+                                let parentId = node.parent;
+                                while (parentId) {
+                                    const parentNode = inst.get_node(parentId);
+                                    if (parentNode && parentNode.id && parentNode.id.startsWith('fiber_cable')) {
+                                        cable = parentNode.id;
+                                        break;
+                                    }
+                                    parentId = parentNode ? parentNode.parent : null;
+                                }
+                                getSegment({ segment, cable });
+                            });
+                        };
+
+                        $tree.off(`open_node.jstree.qolTerm.${label}`);
+                        $tree.on(`open_node.jstree.qolTerm.${label}`, (_e, data) => {
+                            const node = data?.node;
+                            if (!node || !node.id || !node.id.includes('mywcom_fiber_segment/')) return;
+                            const segment = node.id.replace(/out_|in_/g, '');
+                            let cable = null;
+                            let parentId = node.parent;
+                            while (parentId) {
+                                const parentNode = inst.get_node(parentId);
+                                if (parentNode && parentNode.id && parentNode.id.startsWith('fiber_cable')) {
+                                    cable = parentNode.id;
+                                    break;
+                                }
+                                parentId = parentNode ? parentNode.parent : null;
+                            }
+                            logger.debug(FEATURE_NAME, `[${label}] open_node`, node.id, '->', segment, 'cable', cable);
+                            getSegment({ segment, cable });
+                        });
+
+                        const scanEvents = `state_ready.jstree.qolTerm.${label} loaded.jstree.qolTerm.${label} redraw.jstree.qolTerm.${label} refresh.jstree.qolTerm.${label}`;
+                        $tree.off(scanEvents);
+                        $tree.on(scanEvents, (e) => {
+                            logger.debug(FEATURE_NAME, `[${label}]`, e.type, 'scan open nodes');
+                            renderOpenNodes();
+                        });
+                    } catch (err) {
+                        logger.error(FEATURE_NAME, `Termination handler error (patched setEventHandlers ${label})`, err);
+                    }
+                };
+            };
+
+            treeViews.forEach((tv, idx) => patchOne(tv, idx === 0 ? 'struct' : 'route'));
+
+            cableTreePatched = true;
+            return true;
+        }
+
+        function patchCableTreeShow() {
+            if (cableTreeShowPatched) return;
+            const cableTree = window.myw?.app?.plugins?.cableTree;
+            if (!cableTree || typeof cableTree.showTree !== 'function') return;
+            const original = cableTree.showTree.bind(cableTree);
+            cableTree.showTree = function (...args) {
+                logger.debug(FEATURE_NAME, 'cableTree.showTree called', args[2]);
+                const res = original(...args);
+                try {
+                    setTimeout(() => setupTreeListeners(), 0);
+                    setTimeout(() => setupTreeListeners(), 500);
+                    setTimeout(() => setupTreeListeners(), 1500);
+                } catch (err) {
+                    logger.error(FEATURE_NAME, 'showTree hook error', err);
+                }
+                return res;
+            };
+            cableTreeShowPatched = true;
+        }
+
         function setupMutationObserver() {
-            // Create an observer instance linked to the callback function
-            const observer = new MutationObserver((mutations) => {                
-                mutations.forEach(m => {
-                    if (m.addedNodes.length === 0) return; // Ignore removedNodes
+            if (termMutationObserver) {
+                return;
+            }
 
-                    let segment, cable;
-                    const mTarget = m.target;
-
-                    // Skip Splice Closure until code is ready to handle cleanly
-                    if (mTarget.id.startsWith("splice_closure")) {
-                        return;
-                    }
-
-                    // Check if the target is an li element, starts with 'mywcom_fiber_segment/',
-                    // and has the class 'jstree-open' (meaning the segment is expanded)
-                    if (mTarget.nodeName === 'LI'
-                        && mTarget.id.includes('mywcom_fiber_segment/')
-                        && mTarget.classList.contains('jstree-open')) {
-                        segment = mTarget.id.replace(/out_|in_/g, '');
-                        // console.log('Mutation Target:', mTarget);
-                        
-                        let cableElement = mTarget.parentNode;
-                        while (cableElement && !(cableElement.id && cableElement.id.startsWith('fiber_cable'))) {
-                            cableElement = cableElement.parentNode;
-                        }
-                        cable = cableElement ? cableElement.id : null;
-                    }
-
-                    // Check if the target is an a element, starts with 'fiber_cable/',
-                    // and has the attribute 'aria-expanded="true"' (meaning the strand list is expanded)
-                    if (mTarget.nodeName === 'A'
-                        && mTarget.id.includes('fiber_cable/')
-                        && mTarget.attributes['aria-expanded']?.value === 'true') {
-                        
-                        // console.log('Mutation Target:', mTarget);
-                        
-                        cable = mTarget.id.replace(/_anchor/g, '');
-                        
-                        const segmentElement = mTarget.nextSibling.firstChild;
-                        if (segmentElement.classList.contains('jstree-open')) {
-                            segment = segmentElement.id.replace(/out_|in_/g, '');
-                        }
-                    }
-
-                    // Show terminations if we have a segment and cable
-                    if (segment) {
-                        try {
-                            getSegment({segment: segment, cable: cable});
-                        } catch (error) {
-                            console.error('Error:', error);
-                            displayStatusMessage(segment, 'Error, check console');
-                        }
-                        // getSegment({segment: segment, cable: cable}).catch((r) => {
-                        //     console.error('Error reason:', r);
-                        //     displayStatusMessage(segment, 'Error, check console');
-                        // });
-                        // getSegment({segment: segment, cable: cable}).then(({savedTimestamp, segmentData}) => {
-                        //     console.log('Segment data:', segmentData);
-                        //     if (segmentData) {
-                        //         showTerminations(segment, segmentData, savedTimestamp);
-                        //     }
-                        // }).catch(console.error);
-                    }
-                });
+            // Fallback: watch for late-mounted tree and bind listeners
+            termMutationObserver = new MutationObserver(() => {
+                setupTreeListeners();
             });
     
-            // Start observing the target node for configured mutations
-            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['id'] });
+            termMutationObserver.observe(document.body, { childList: true, subtree: true });
+        }
+
+        function stopObserving() {
+            if (termMutationObserver) {
+                termMutationObserver.disconnect();
+                termMutationObserver = null;
+            }
+            // Clean up all termination UI when stopping
+            cleanupTerminationUI();
+        }
+        
+        function cleanupTerminationUI() {
+            // Remove all injected termination elements from the tree
+            const tree = document.querySelector('#related-equipment-tree-container');
+            if (tree) {
+                tree.querySelectorAll('.qol-term-row, .qol-status-message').forEach((el) => el.remove());
+                tree.querySelectorAll('a.jstree-anchor.qol-term').forEach((anchor) => {
+                    anchor.classList.remove('qol-term');
+                    if (anchor.dataset.qolOriginalHtml) {
+                        anchor.innerHTML = anchor.dataset.qolOriginalHtml;
+                    }
+                });
+            }
         }
     
         return {
             setupMutationObserver: setupMutationObserver,
+            setupTreeListeners: setupTreeListeners,
+            stopObserving: stopObserving,
             getRouteSegments: getRouteSegments,
-            getSegment: getSegment
+            getSegment: getSegment,
+            _debugSegmentRequests: segmentRequests
         };
     })();
 
@@ -2346,13 +3103,6 @@ function runWhenReady(readySelector, callback) {
     //     return es;
     // };
 
-    // Load each feature
-    // todo: setup single observer for all features
-    featureDetailsPopup.observe();
-    // featureStrandCalc.observe();
-    // featureBetterSpliceDetails.observe();
-    featureBetterTerminations.setupMutationObserver();
-    featureHorizontalMenu.run();
 
     /*
 
@@ -2436,562 +3186,774 @@ function runWhenReady(readySelector, callback) {
 
 
     
-})();
-
 // Error Monitor
-runWhenReady("#map_canvas", () => {
-    'use strict';
+    const errorMonitorFeature = (() => {
+        let started = false;
+        let cleanupFns = [];
+        let uiObserver = null;
+        let footerObserver = null;
+        let wrapper = null;
+        let btn = null;
+        let panel = null;
+        let panelOpen = false;
+        let currentFilter = 'all';
+        const logs = [];
+        const IGNORE_URL_PATTERNS = [
+            /googleapis\.com\/maps\/api\/mapsjs\//,
+            /optical_node_closure_spec/
+        ];
+        const IGNORE_404_PATTERNS = [
+            /\/modules\/comms\/structure\/manhole\// // expected 404 when structure exists only in delta
+        ];
+        const LEGACY_BUTTON_POS_KEY = 'qol-errmon-btn-pos'; // Implemented 2026-01-13. To be removed at a later date
 
-    const IGNORE_URL_PATTERNS = [
-        /googleapis\.com\/maps\/api\/mapsjs\//,
-        /optical_node_closure_spec/
-    ];
-
-    // ─── State ────────────────────────────────────────────────────────────
-    const logs = [];
-    const STORAGE_KEY = 'qol-errmon-btn-pos';
-
-    // ─── Helpers ──────────────────────────────────────────────────────────
-    function shouldIgnoreLog(entry) {
-        if (entry.url) {
-            for (const pat of IGNORE_URL_PATTERNS) {
-                if (pat.test(entry.url)) return true;
-            }
-        }
-        if (entry.message) {
-            for (const pat of IGNORE_URL_PATTERNS) {
-                if (pat.test(entry.message)) return true;
-            }
-        }
-        return false;
-    }
-    function addLog(entry) {
-        // drop anything matching an ignore pattern
-        if (shouldIgnoreLog(entry)) return;
-        
-        logs.push({ time: new Date(), ...entry });
-        if (panelOpen) renderLogs(currentFilter);
-        updateButtonColor();
-    }
-    function formatTime(d) {
-        return d.toLocaleTimeString();
-    }
-    function updateButtonColor() {
-        btn.style.backgroundColor = logs.length > 0 ? '#e33' : '#3a3'; // red if errors, green if none
-    }
-    function saveBtnPosition(x, y) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ x, y }));
-    }
-    function getBtnPosition() {
-        try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); }
-        catch(e){ return null; }
-    }
-
-    // ─── Override console.error/warn ──────────────────────────────────────
-    ['error'].forEach((level) => { // 2025-04-18 Removed use of 'warn'
-        const orig = console[level];
-        console[level] = function (...args) {
-            addLog({ type: 'console', level, message: args.map(String).join(' ') });
-            orig.apply(console, args);
-        };
-    });
-
-    // ─── Capture uncaught errors & rejections ─────────────────────────────
-    window.addEventListener('error', (e) => {
-        addLog({ type: 'console', level: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-        addLog({ type: 'console', level: 'error', message: 'UnhandledRejection: ' + (e.reason?.toString() || e.reason) });
-    });
-
-    // ─── Wrap fetch ───────────────────────────────────────────────────────
-    const origFetch = window.fetch;
-    window.fetch = function (...args) {
-        return origFetch.apply(this, args).then((res) => {
-            if (!res.ok) {
-                addLog({ type: 'network', method: 'fetch', status: res.status, url: res.url, message: `${res.status} ${res.statusText}` });
-            }
-            return res;
-        }).catch((err) => {
-            addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: err.toString() });
-            throw err;
-        });
-    };
-
-    // ─── Wrap XHR ─────────────────────────────────────────────────────────
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        this._errmon = { method, url };
-        return origOpen.call(this, method, url, ...rest);
-    };
-    XMLHttpRequest.prototype.send = function (...args) {
-        this.addEventListener('loadend', () => {
-            const { status, statusText } = this;
-            if (status < 200 || status >= 300) {
-                addLog({ type: 'network', method: this._errmon.method, status, url: this._errmon.url, message: `${status} ${statusText}` });
-            }
-        });
-        this.addEventListener('error', () => {
-            addLog({ type: 'network', method: this._errmon.method, status: 'ERR', url: this._errmon.url, message: 'XHR error' });
-        });
-        return origSend.apply(this, args);
-    };
-
-    // ─── Build UI ──────────────────────────────────────────────────────────
-    let panelOpen = false, currentFilter = 'all';
-
-    // Floating button
-    const btn = document.createElement('button');
-    btn.textContent = '🐞';
-    Object.assign(btn.style, {
-        position: 'fixed', width: '40px', height: '40px', borderRadius: '50%', 
-        color: '#fff', border: 'none', cursor: 'move', zIndex: 99999
-    });
-    // load saved position or default
-    const pos = getBtnPosition();
-    if (pos?.x!=null && pos?.y!=null) {
-        btn.style.left = pos.x + 'px';
-        btn.style.top = pos.y + 'px';
-    } else {
-        btn.style.bottom = '20px';
-        btn.style.right = '20px';
-    }
-    updateButtonColor();
-    document.body.appendChild(btn);
-
-    // Draggable behavior
-    let isDragging = false, startX, startY;
-    btn.addEventListener('mousedown', (e) => {
-        isDragging = true;
-        startX = e.clientX - btn.offsetLeft;
-        startY = e.clientY - btn.offsetTop;
-        document.addEventListener('mousemove', onDrag);
-        document.addEventListener('mouseup', onStopDrag);
-        e.preventDefault();
-    });
-    function onDrag(e) {
-        if (!isDragging) return;
-        if (panelOpen) return; // to prevent moving under the panel unintentionally
-        const x = e.clientX - startX, y = e.clientY - startY;
-        btn.style.left = x + 'px';
-        btn.style.top = y + 'px';
-    }
-    function onStopDrag() {
-        if (isDragging) {
-            isDragging = false;
-            document.removeEventListener('mousemove', onDrag);
-            document.removeEventListener('mouseup', onStopDrag);
-            saveBtnPosition(btn.offsetLeft, btn.offsetTop);
-        }
-    }
-
-    // Panel container
-    const panel = document.createElement('div');
-    Object.assign(panel.style, {
-        position: 'fixed', width: '400px', maxHeight: '60vh', background: '#fff', 
-        border: '1px solid #888', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', 
-        padding: '8px', overflow: 'auto', fontSize: '12px', display: 'none', zIndex: 99999
-    });
-    document.body.appendChild(panel);
-
-    // Header with filters & clear
-    const header = document.createElement('div');
-    header.innerHTML = `
-        <button data-filter="all">All</button>
-        <button data-filter="console">Console</button>
-        <button data-filter="network">Network</button>
-        <button id="err-clear" style="float:right">Clear</button>
-        <hr/>
-    `;
-    panel.appendChild(header);
-
-    const list = document.createElement('ul');
-    Object.assign(list.style, { padding:'0', listStyle:'none' });
-    panel.appendChild(list);
-
-    btn.addEventListener('click', () => {
-        panelOpen = !panelOpen;
-        if (panelOpen) {
-            panel.style.display = 'block';
-
-            const btnRect = btn.getBoundingClientRect();
-            const pH      = panel.offsetHeight;
-            const pW      = panel.offsetWidth;
-            const off     = 10;
-            const vW      = window.innerWidth;
-            const vH      = window.innerHeight;
-
-            // Vertical position: above if enough space, otherwise below
-            let top;
-            if (btnRect.top >= pH + off) {
-                top = btnRect.top - pH - off;
-            } else {
-                top = btnRect.bottom + off;
-            }
-
-            // Horizontal position: align left but clamp within viewport
-            let left = btnRect.left;
-            if (left + pW + off > vW) {
-                left = vW - pW - off;
-            }
-            if (left < off) {
-                left = off;
-            }
-
-            panel.style.top  = top  + 'px';
-            panel.style.left = left + 'px';
-
-            renderLogs(currentFilter);
-        } else {
-            panel.style.display = 'none';
-        }
-    });
-
-    // Filter & clear
-    header.querySelectorAll('button[data-filter]').forEach((fb) => {
-        fb.addEventListener('click', () => {
-            currentFilter = fb.dataset.filter;
-            renderLogs(currentFilter);
-        });
-    });
-    header.querySelector('#err-clear').addEventListener('click', () => {
-        logs.length = 0;
-        updateButtonColor();
-        renderLogs(currentFilter);
-    });
-
-    function renderLogs(filter) {
-        list.innerHTML = '';
-        logs.forEach((log) => {
-            if (filter !== 'all' && log.type !== filter) return;
-            const li = document.createElement('li');
-            li.style.marginBottom = '6px';
-            li.innerHTML = `
-                <strong>[${formatTime(log.time)}]</strong>
-                <em>(${log.type}${log.level ? '/' + log.level : ''}${log.method ? '/' + log.method : ''})</em>
-                <div>${log.message}</div>
-                ${log.url ? `<div style="font-size:10px;color:#555;">${log.url}</div>` : ''}
-            `;
-            list.appendChild(li);
-        });
-        if (!list.children.length)
-            list.innerHTML = '<li><em>No entries</em></li>';
-    }
-
-    const uiObserver = new MutationObserver((mutations, obs) => {
-        // once we see <body>, inject UI and stop observing
-        if (document.body) {
-            document.body.appendChild(btn);
-            document.body.appendChild(panel);
-            obs.disconnect();
-        }
-    });
-    // try immediately, otherwise wait for the body to appear
-    if (document.body) {
-        document.body.appendChild(btn);
-        document.body.appendChild(panel);
-    } else {
-        uiObserver.observe(document.documentElement, { childList: true, subtree: true });
-    }
-});
-
-// Plugin Overrides: displayManager, locManager
-(function () {
-    'use strict';
-
-    function waitFor(predicate, { timeoutMs = 30000, intervalMs = 500 } = {}) {
-        return new Promise((resolve, reject) => {
-            const start = Date.now();
-            const tick = () => {
-                try {
-                    const val = predicate();
-                    if (val) return resolve(val);
-                } catch {
-                    /* ignore */
-                }
-                if (Date.now() - start >= timeoutMs)
-                    return reject(new Error('waitFor: timeout'));
-                setTimeout(tick, intervalMs);
-            };
-            tick();
-        });
-    }
-
-    const getDisplayManager = () => {
-        try {
-            return window.myw?.app?.plugins?.displayManager || null;
-        } catch {
-            return null;
-        }
-    };
-
-    const getStructureManager = () => {
-        try {
-            return window.myw?.app?.plugins?.structureManager || null;
-        } catch {
-            return null;
-        }
-    };
-
-    const getLocManager = () => {
-        try {
-            return window.myw?.app?.plugins?.locManager || null;
-        } catch {
-            return null;
-        }
-    };
-
-    const getEquipTreeView = () => {
-        try {
-            return window.myw?.app?.plugins?.equipmentTree?.treeView || null;
-        } catch {
-            return null;
-        }
-    };
-
-
-    async function patchDisplayManager() {
-        const dm = await waitFor(getDisplayManager);
-        if (!dm || dm.__connLabelPatchedSimple) return;
-
-        // Use a normal function to preserve `this` so calls to this.msg / this.getColorHTMLFor work
-        dm._connLabel = function (pin, conn) {
-            const toPin = conn.toPinFor(pin);
-
-            // Build direction indicator (fallback when to_feature is missing)
-            const connDir = conn?.to_feature ? this._connDir(conn) : '<-?->';
-
-            // Build feature ident
-            let ftrStr = '';
-            if (conn?.to_cable) {
-                ftrStr = conn.to_cable.properties?.name ?? '';
-            } else if (conn?.to_feature) {
-                ftrStr = conn.to_feature.properties?.name ?? '';
-            }
-
-            // Build pin ident
-            let pinStr;
-            if (conn?.to_cable) {
-                if (conn.to_cable.properties?.directed) {
-                    pinStr = '' + toPin;
-                } else {
-                    pinStr = this.msg('cable_pin_' + conn.to_pins.side) + ':' + toPin;
-                }
-                pinStr += this.getColorHTMLFor(conn.to_cable, toPin, 'to');
-            } else {
-                if (conn?.to_feature) {
-                    const sideLabel = conn.to_feature.getSideLabelID(conn.to_pins.side);
-                    pinStr = this.msg('side_' + sideLabel + ':' + toPin);
-                } else {
-                    pinStr = `${conn?.to_ref ? conn.to_ref : '?'}:${toPin}`;
-                }
-            }
-
-            return ` ${connDir} ${ftrStr} #${pinStr}`;
-        };
-
-        Object.defineProperty(dm, '__connLabelPatchedSimple', { value: true });
-        console.info('[userscript] Patched displayManager._connLabel');
-    }
-
-    async function patchLocManager() {
-        const lm = await waitFor(getLocManager);
-        if (!lm || lm.__getFeatureLOCDetailsAtPatched) return;
-
-        // Keep async signature so callers using await remain compatible
-        lm.getFeatureLOCDetailsAt = async function (struct, features, segments = true, include_proposed = false) {
-            return {};
-        };
-
-        Object.defineProperty(lm, '__getFeatureLOCDetailsAtPatched', { value: true });
-        console.info('[userscript] Patched locManager.getFeatureLOCDetailsAt');
-    }
-
-    async function patchEquipmentTreeSaveState() {
-        const timeoutMs = 10 * 60 * 1000;
-        const treeView = await waitFor(getEquipTreeView, { timeoutMs: timeoutMs, intervalMs: 1000 });
-        if (!treeView || treeView.__saveStatePatched) return;
-
-        // Seed incremental open-set from any prior saved state
-        treeView.owner = treeView.owner || {};
-        treeView.owner.saved_state = treeView.owner.saved_state || {};
-        const stateKey = treeView?.rootUrn;
-        const prior = (treeView.owner.saved_state[stateKey]?.open) || [];
-        treeView._openSet = new Set(prior);
-
-        // Guard flag: pause saves during loading/restore bursts
-        treeView._suspendSaveState = false;
-
-        // Lightweight check for "node or any parent is loading"
-        function isNodeOrParentsLoading(inst, node) {
+        function purgeLegacyErrorMonitorState() {
             try {
-                if (inst.is_loading && inst.is_loading(node)) return true;
-                if (node && Array.isArray(node.parents)) {
-                    for (let i = 0; i < node.parents.length; i++) {
-                        const p = inst.get_node(node.parents[i]);
-                        if (inst.is_loading && inst.is_loading(p)) return true;
-                        if (p && p.state && p.state.loading) return true;
+                if (window.localStorage && localStorage.getItem(LEGACY_BUTTON_POS_KEY) !== null) {
+                    localStorage.removeItem(LEGACY_BUTTON_POS_KEY);
+                }
+            } catch (e) {
+                // Ignore storage access issues; legacy cleanup is best-effort only
+            }
+        }
+
+        // Clean up legacy Error Monitor button position state from older script versions
+        purgeLegacyErrorMonitorState();
+
+        function shouldIgnoreLog(entry) {
+            if (entry.url) {
+                for (const pat of IGNORE_URL_PATTERNS) {
+                    if (pat.test(entry.url)) return true;
+                }
+            }
+            if (entry.message) {
+                for (const pat of IGNORE_URL_PATTERNS) {
+                    if (pat.test(entry.message)) return true;
+                }
+            }
+            return false;
+        }
+
+        function addLog(entry) {
+            if (shouldIgnoreLog(entry)) return;
+            logs.push({ time: new Date(), ...entry });
+            if (panelOpen) renderLogs(currentFilter);
+            updateButtonColor();
+        }
+
+        function formatTime(d) {
+            return d.toLocaleTimeString();
+        }
+
+        function updateButtonColor() {
+            if (!btn) return;
+            
+            const hasErrors = logs.length > 0;
+            
+            if (hasErrors) {
+                // Red X icon for errors
+                btn.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg"
+                         width="18" height="18" viewBox="0 0 18 18"
+                         aria-hidden="true"
+                         style="display: block; transition: filter 0.15s, transform 0.1s;">
+                      <circle cx="9" cy="9" r="7.5"
+                              fill="#ffffff"
+                              stroke="#000000"
+                              stroke-width="1.25"/>
+                      <path d="M6 6 L12 12 M12 6 L6 12"
+                            fill="none"
+                            stroke="#dc2626"
+                            stroke-width="2.5"
+                            stroke-linecap="round"/>
+                    </svg>
+                `;
+            } else {
+                // Green checkmark icon for no errors
+                btn.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg"
+                         width="18" height="18" viewBox="0 0 18 18"
+                         aria-hidden="true"
+                         style="display: block; transition: filter 0.15s, transform 0.1s;">
+                      <circle cx="9" cy="9" r="7.5"
+                              fill="#ffffff"
+                              stroke="#000000"
+                              stroke-width="1.25"/>
+                      <path d="M5.5 9.5 L8 12 L12.5 6.75"
+                            fill="none"
+                            stroke="#16a34a"
+                            stroke-width="2.5"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"/>
+                    </svg>
+                `;
+            }
+            
+            // Add hover/active feedback
+            const svg = btn.querySelector('svg');
+            if (svg) {
+                svg.addEventListener('mouseenter', function() {
+                    this.style.filter = 'brightness(0.9)';
+                });
+                svg.addEventListener('mouseleave', function() {
+                    this.style.filter = '';
+                });
+                svg.addEventListener('mousedown', function() {
+                    this.style.transform = 'translateY(1px)';
+                });
+                svg.addEventListener('mouseup', function() {
+                    this.style.transform = '';
+                });
+            }
+        }
+
+        function renderLogs(filter) {
+            if (!panel) return;
+            const list = panel.querySelector('ul');
+            if (!list) return;
+            list.innerHTML = '';
+            logs.forEach((log) => {
+                if (filter !== 'all' && log.type !== filter) return;
+                const li = document.createElement('li');
+                li.style.marginBottom = '6px';
+                li.style.wordBreak = 'break-word';
+                li.style.overflowWrap = 'break-word';
+                li.innerHTML = `
+                    <strong>[${formatTime(log.time)}]</strong>
+                    <em>(${log.type}${log.level ? '/' + log.level : ''}${log.method ? '/' + log.method : ''})</em>
+                    <div>${log.message}</div>
+                    ${log.url ? `<div style="font-size:10px;color:#555;word-break:break-all;">${log.url}</div>` : ''}
+                `;
+                list.appendChild(li);
+            });
+            if (!list.children.length) {
+                list.innerHTML = '<li><em>No entries</em></li>';
+            }
+        }
+
+        function teardownUi() {
+            if (uiObserver) {
+                uiObserver.disconnect();
+                uiObserver = null;
+            }
+            if (footerObserver) {
+                footerObserver.disconnect();
+                footerObserver = null;
+            }
+            if (wrapper && wrapper.parentNode) {
+                wrapper.remove();
+            }
+            if (panel && panel.parentNode) {
+                panel.remove();
+            }
+            wrapper = null;
+            btn = null;
+            panel = null;
+            panelOpen = false;
+        }
+
+        function start() {
+            if (started) return;
+            started = true;
+            runWhenReady('#map_canvas', () => {
+                cleanupFns.push(teardownUi);
+
+                ['error'].forEach((level) => {
+                    const orig = console[level];
+                    console[level] = function (...args) {
+                        addLog({ type: 'console', level, message: args.map(String).join(' ') });
+                        orig.apply(console, args);
+                    };
+                    cleanupFns.push(() => { console[level] = orig; });
+                });
+
+                const errListener = (e) => {
+                    addLog({ type: 'console', level: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
+                };
+                const rejListener = (e) => {
+                    addLog({ type: 'console', level: 'error', message: 'UnhandledRejection: ' + (e.reason?.toString() || e.reason) });
+                };
+                window.addEventListener('error', errListener);
+                window.addEventListener('unhandledrejection', rejListener);
+                cleanupFns.push(() => {
+                    window.removeEventListener('error', errListener);
+                    window.removeEventListener('unhandledrejection', rejListener);
+                });
+
+                const origFetch = window.fetch;
+                window.fetch = function (...args) {
+                    return origFetch.apply(this, args).then((res) => {
+                        const url = res?.url || args[0] || '';
+                        if (!res.ok) {
+                            if (!(res.status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
+                                addLog({ type: 'network', method: 'fetch', status: res.status, url, message: `${res.status} ${res.statusText}` });
+                            }
+                        }
+                        return res;
+                    }).catch((err) => {
+                        addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: err.toString() });
+                        throw err;
+                    });
+                };
+                cleanupFns.push(() => { window.fetch = origFetch; });
+
+                const origOpen = XMLHttpRequest.prototype.open;
+                const origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+                    this._errmon = { method, url };
+                    return origOpen.call(this, method, url, ...rest);
+                };
+                XMLHttpRequest.prototype.send = function (...args) {
+                    this.addEventListener('loadend', () => {
+                        const { status, statusText } = this;
+                        const url = this._errmon.url;
+                        if (status < 200 || status >= 300) {
+                            if (!(status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
+                                addLog({ type: 'network', method: this._errmon.method, status, url, message: `${status} ${statusText}` });
+                            }
+                        }
+                    });
+                    this.addEventListener('error', () => {
+                        addLog({ type: 'network', method: this._errmon.method, status: 'ERR', url: this._errmon.url, message: 'XHR error' });
+                    });
+                    return origSend.apply(this, args);
+                };
+                cleanupFns.push(() => {
+                    XMLHttpRequest.prototype.open = origOpen;
+                    XMLHttpRequest.prototype.send = origSend;
+                });
+
+                // Create footer button icon
+                btn = document.createElement('span');
+                btn.title = 'Error Monitor';
+                btn.style.cursor = 'pointer';
+                
+                // Create SVG alert icon (initial state)
+                btn.innerHTML = '';
+                updateButtonColor();
+
+                // Create panel
+                panel = document.createElement('div');
+                Object.assign(panel.style, {
+                    position: 'fixed', width: '400px', maxHeight: '60vh', background: '#fff', 
+                    border: '1px solid #888', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', 
+                    fontSize: '12px', display: 'none', zIndex: 99999,
+                    overflow: 'hidden'
+                });
+
+                // Position panel near bottom-right with viewport-aware boundary checks
+                var positionErrorPanel = function() {
+                    if (!panel) {
+                        return;
+                    }
+                    // Desired offsets matching previous behavior
+                    var desiredBottom = 30; // px
+                    var desiredRight = 10;  // px
+
+                    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    // Panel is constrained to 60% of viewport height
+                    var maxPanelHeight = vh * 0.6;
+
+                    // Ensure bottom offset plus max height does not exceed viewport
+                    if (desiredBottom + maxPanelHeight > vh) {
+                        desiredBottom = Math.max(10, vh - maxPanelHeight - 10);
+                    }
+
+                    panel.style.bottom = desiredBottom + 'px';
+                    panel.style.right = desiredRight + 'px';
+                };
+
+                // Initial positioning and keep responsive on resize
+                positionErrorPanel();
+                window.addEventListener('resize', positionErrorPanel);
+                const header = document.createElement('div');
+                Object.assign(header.style, {
+                    padding: '8px',
+                    borderBottom: '1px solid #ccc',
+                    background: '#f5f5f5'
+                });
+                header.innerHTML = `
+                    <button data-filter="all">All</button>
+                    <button data-filter="console">Console</button>
+                    <button data-filter="network">Network</button>
+                    <button id="err-clear" style="float:right">Clear</button>
+                    <hr style="margin-top: 8px; margin-bottom: 0;"/>
+                `;
+                panel.appendChild(header);
+
+                const list = document.createElement('ul');
+                Object.assign(list.style, { 
+                    padding: '8px', 
+                    paddingRight: '16px',
+                    listStyle: 'none',
+                    margin: '0',
+                    maxHeight: 'calc(60vh - 60px)',
+                    overflowY: 'auto',
+                    overflowX: 'hidden'
+                });
+                panel.appendChild(list);
+
+                btn.addEventListener('click', () => {
+                    panelOpen = !panelOpen;
+                    panel.style.display = panelOpen ? 'block' : 'none';
+                    if (panelOpen) {
+                        renderLogs(currentFilter);
+                    }
+                });
+
+                header.querySelectorAll('button[data-filter]').forEach((fb) => {
+                    fb.addEventListener('click', () => {
+                        currentFilter = fb.dataset.filter;
+                        renderLogs(currentFilter);
+                    });
+                });
+                header.querySelector('#err-clear').addEventListener('click', () => {
+                    logs.length = 0;
+                    updateButtonColor();
+                    renderLogs(currentFilter);
+                });
+
+                const injectUi = () => {
+                    const footerRight = document.getElementById('footer-right');
+                    if (!footerRight) return false;
+                    
+                    // Create wrapper span with same structure as other footer elements
+                    wrapper = document.createElement('span');
+                    const iconSpan = document.createElement('span');
+                    iconSpan.className = 'plugin-icon';
+                    iconSpan.appendChild(btn);
+                    
+                    const messageSpan = document.createElement('span');
+                    messageSpan.className = 'plugin-message';
+                    
+                    wrapper.appendChild(iconSpan);
+                    wrapper.appendChild(messageSpan);
+                    
+                    // Insert as first child in footer-right
+                    footerRight.insertBefore(wrapper, footerRight.firstChild);
+                    
+                    // Append panel to body
+                    document.body.appendChild(panel);
+                    
+                    // Watch for new elements being added to footer and keep error monitor at start
+                    footerObserver = new MutationObserver(() => {
+                        if (wrapper && wrapper.parentNode === footerRight) {
+                            // Only reposition if we're not already first
+                            if (footerRight.firstChild !== wrapper) {
+                                footerRight.insertBefore(wrapper, footerRight.firstChild);
+                            }
+                        }
+                    });
+                    footerObserver.observe(footerRight, { childList: true });
+                    
+                    return true;
+                };
+
+                if (!injectUi()) {
+                    uiObserver = new MutationObserver((mutations, obs) => {
+                        if (injectUi()) {
+                            obs.disconnect();
+                        }
+                    });
+                    uiObserver.observe(document.documentElement, { childList: true, subtree: true });
+                }
+            });
+        }
+
+        function stop() {
+            if (!started) return;
+            started = false;
+            while (cleanupFns.length) {
+                const fn = cleanupFns.pop();
+                try { fn(); } catch (e) { console.warn('[userscript] Error monitor cleanup failed', e); }
+            }
+        }
+
+        return { start, stop };
+    })();
+
+    // Plugin Overrides: displayManager, locManager
+    const pluginOverridesFeature = (() => {
+        'use strict';
+
+        let started = false;
+
+        function waitFor(predicate, { timeoutMs = 30000, intervalMs = 500 } = {}) {
+            return new Promise((resolve, reject) => {
+                const start = Date.now();
+                const tick = () => {
+                    try {
+                        const val = predicate();
+                        if (val) return resolve(val);
+                    } catch {
+                        /* ignore */
+                    }
+                    if (Date.now() - start >= timeoutMs)
+                        return reject(new Error('waitFor: timeout'));
+                    setTimeout(tick, intervalMs);
+                };
+                tick();
+            });
+        }
+
+        const getDisplayManager = () => {
+            try {
+                return window.myw?.app?.plugins?.displayManager || null;
+            } catch {
+                return null;
+            }
+        };
+
+        const getStructureManager = () => {
+            try {
+                return window.myw?.app?.plugins?.structureManager || null;
+            } catch {
+                return null;
+            }
+        };
+
+        const getLocManager = () => {
+            try {
+                return window.myw?.app?.plugins?.locManager || null;
+            } catch {
+                return null;
+            }
+        };
+
+        const getEquipTreeView = () => {
+            try {
+                return window.myw?.app?.plugins?.equipmentTree?.treeView || null;
+            } catch {
+                return null;
+            }
+        };
+
+
+        async function patchDisplayManager() {
+            const dm = await waitFor(getDisplayManager);
+            if (!dm || dm.__connLabelPatchedSimple) return;
+
+            // Use a normal function to preserve `this` so calls to this.msg / this.getColorHTMLFor work
+            dm._connLabel = function (pin, conn) {
+                const toPin = conn.toPinFor(pin);
+
+                // Build direction indicator (fallback when to_feature is missing)
+                const connDir = conn?.to_feature ? this._connDir(conn) : '<-?->';
+
+                // Build feature ident
+                let ftrStr = '';
+                if (conn?.to_cable) {
+                    ftrStr = conn.to_cable.properties?.name ?? '';
+                } else if (conn?.to_feature) {
+                    ftrStr = conn.to_feature.properties?.name ?? '';
+                }
+
+                // Build pin ident
+                let pinStr;
+                if (conn?.to_cable) {
+                    if (conn.to_cable.properties?.directed) {
+                        pinStr = '' + toPin;
+                    } else {
+                        pinStr = this.msg('cable_pin_' + conn.to_pins.side) + ':' + toPin;
+                    }
+                    pinStr += this.getColorHTMLFor(conn.to_cable, toPin, 'to');
+                } else {
+                    if (conn?.to_feature) {
+                        const sideLabel = conn.to_feature.getSideLabelID(conn.to_pins.side);
+                        pinStr = this.msg('side_' + sideLabel + ':' + toPin);
+                    } else {
+                        pinStr = `${conn?.to_ref ? conn.to_ref : '?'}:${toPin}`;
                     }
                 }
-                return node && node.state && node.state.loading;
-            } catch {
-                return false;
-            }
+
+                return ` ${connDir} ${ftrStr} #${pinStr}`;
+            };
+
+            Object.defineProperty(dm, '__connLabelPatchedSimple', { value: true });
+            console.info('[userscript] Patched displayManager._connLabel');
         }
 
-        // Replace saveState: O(1) add/remove; skip while loading
-        treeView.saveState = function (nodeData) {
-            if (!this.owner.saved_state || this._suspendSaveState) return;
-            if (!nodeData || !nodeData.instance) return;
+        async function patchLocManager() {
+            const lm = await waitFor(getLocManager);
+            if (!lm || lm.__getFeatureLOCDetailsAtPatched) return;
 
-            const inst = nodeData.instance;
-            const node = inst.get_node(nodeData.node || nodeData);
-            if (!node) return;
+            // Keep async signature so callers using await remain compatible
+            lm.getFeatureLOCDetailsAt = async function (struct, features, segments = true, include_proposed = false) {
+                return {};
+            };
 
-            if (isNodeOrParentsLoading(inst, node)) return;
+            Object.defineProperty(lm, '__getFeatureLOCDetailsAtPatched', { value: true });
+            console.info('[userscript] Patched locManager.getFeatureLOCDetailsAt');
+        }
 
-            if (node.state && node.state.opened) {
-                this._openSet.add(node.id);
-            } else {
-                this._openSet.delete(node.id);
-            }
-            this.owner.saved_state[this.rootUrn] = { open: Array.from(this._openSet) };
-        };
+        let saveStatePatchRetryId = null;
 
-        // Bind guards when the container exists; re-bind on SPA remounts
-        function bindGuardsIfReady() {
+        async function patchEquipmentTreeSaveState() {
+            // Try with a reasonable initial timeout
+            let treeView;
             try {
-                const equipTreeContainer = treeView && treeView.container ? $(treeView.container) : null;
-                if (!equipTreeContainer || !equipTreeContainer.length) return false;
-                if (equipTreeContainer.data('__saveStateGuardBound')) return true;
-
-                let resumeTimer;
-                equipTreeContainer
-                    .off('.saveStateGuard')
-                    .on('loading.jstree.saveStateGuard', function () {
-                        treeView._suspendSaveState = true;
-                        clearTimeout(resumeTimer);
-                    })
-                    .on('load_node.jstree.saveStateGuard after_open.jstree.saveStateGuard', function () {
-                        clearTimeout(resumeTimer);
-                        resumeTimer = setTimeout(() => { treeView._suspendSaveState = false; }, 200);
-                    });
-
-                equipTreeContainer.data('__saveStateGuardBound', true);
-                console.info('[userscript] Bound saveState guards on equipmentTree container');
-                return true;
-            } catch {
-                return false;
-            }
-        }
-
-        // Try now, then poll lightly to catch future remounts
-        bindGuardsIfReady();
-        if (treeView.__saveStateGuardPollId) clearInterval(treeView.__saveStateGuardPollId);
-        treeView.__saveStateGuardPollId = setInterval(bindGuardsIfReady, 1000);
-
-        Object.defineProperty(treeView, '__saveStatePatched', { value: true });
-        console.info('[userscript] Patched equipmentTree.treeView.saveState');
-    }
-
-    // async function armEquipmentTreeStateTrigger() {
-    //     const treeView = await waitFor(getEquipTree);
-    //     const sm = await waitFor(getStructureManager);
-    //     const app = window.myw?.app;
-
-    //     if (!treeView || !sm || !app) return;
-
-    //     sm.trigger('state-changed', sm.app.currentFeature);
-
-    //     // Try now and re-try periodically to catch SPA remounts
-    //     bindNow();
-    //     if (treeView.__restoreTriggerPollIdV2) clearInterval(treeView.__restoreTriggerPollIdV2);
-    //     treeView.__restoreTriggerPollIdV2 = setInterval(bindNow, 1000);
-    // }
-
-    async function patchStructureManager() {
-        const sm = await waitFor(getStructureManager);
-        if (!sm || sm.__structContentPatched) return;
-
-        const original = sm.structContent;
-        if (typeof original !== 'function') {
-            console.warn('[userscript] structureManager.structContent not a function');
-            return;
-        }
-
-        // Replace with a delegating wrapper (preserves scope of StructContents called within original structContent)
-        sm.structContent = async function (struct, includeProposed = false, layer = undefined) {
-            // Only override when we can compute a sensible layer
-            try {
-                // const equipTree = getEquipTree();
-                const structUrn = (struct && struct.type && struct.id) ? (struct.type + '/' + struct.id) : null;
-
-                let newLayer = layer; // default: keep whatever caller passed
-
-                // if (equipTree && equipTree.saved_state && structUrn) {
-                    // const ss = equipTree.saved_state[structUrn];
-                    // const openList = Array.isArray(ss?.open) ? ss.open : null;
-
-                    // If caller points at the struct root (or didn't specify a layer),
-                    // redirect to a "deepest recently opened" node when available.
-                    //if ((layer === undefined || layer === structUrn) && openList && openList.length) {
-                        // Heuristic: last opened entry tends to be the deepest after restore
-                        //newLayer = openList[openList.length - 1];
-                        // Uncomment for debug:
-                        //console.log('[userscript] structContent: redirected layer ->', newLayer);
-                    //}
-
-                if (layer === structUrn) {
-                    newLayer = undefined;
-                    console.log(`[userscript] structContent: redirected layer ${layer} -> ${newLayer}`);
-                }
-                // }
-
-                // Delegate back to the original (keeps the correct StructContents constructor)
-                return await original.call(this, struct, includeProposed, newLayer);
+                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
             } catch (e) {
-                console.warn('[userscript] structContent override error; falling back to original', e);
-                return await original.call(this, struct, includeProposed, layer);
+                // If initial attempt fails, set up periodic retry
+                if (!saveStatePatchRetryId) {
+                    console.info('[userscript] EquipTreeView not found yet, will retry periodically...');
+                    saveStatePatchRetryId = setInterval(() => {
+                        const tv = getEquipTreeView();
+                        if (tv && !tv.__saveStatePatched) {
+                            clearInterval(saveStatePatchRetryId);
+                            saveStatePatchRetryId = null;
+                            patchEquipmentTreeSaveState(); // Retry the patch
+                        }
+                    }, 5000); // Check every 5 seconds
+                }
+                return;
             }
-        };
 
-        Object.defineProperty(sm, '__structContentPatched', { value: true });
-        console.info('[userscript] Patched structureManager.structContent (delegating, no direct StructContents)');
-    }
+            if (!treeView || treeView.__saveStatePatched) return;
 
-    async function applyPatches() {
-        try { 
-            await Promise.all([
-                patchDisplayManager(), 
-                patchLocManager(), 
-                patchEquipmentTreeSaveState(),
-                patchStructureManager()
-            ]);
-        } catch (e) { 
-            console.error('[userscript] Patching error:', e); 
+            // Seed incremental open-set from any prior saved state
+            treeView.owner = treeView.owner || {};
+            treeView.owner.saved_state = treeView.owner.saved_state || {};
+            const stateKey = treeView?.rootUrn;
+            const prior = (treeView.owner.saved_state[stateKey]?.open) || [];
+            treeView._openSet = new Set(prior);
+
+            // Guard flag: pause saves during loading/restore bursts
+            treeView._suspendSaveState = false;
+
+            // Lightweight check for "node or any parent is loading"
+            function isNodeOrParentsLoading(inst, node) {
+                try {
+                    if (inst.is_loading && inst.is_loading(node)) return true;
+                    if (node && Array.isArray(node.parents)) {
+                        for (let i = 0; i < node.parents.length; i++) {
+                            const p = inst.get_node(node.parents[i]);
+                            if (inst.is_loading && inst.is_loading(p)) return true;
+                            if (p && p.state && p.state.loading) return true;
+                        }
+                    }
+                    return node && node.state && node.state.loading;
+                } catch {
+                    return false;
+                }
+            }
+
+            // Replace saveState: O(1) add/remove; skip while loading
+            treeView.saveState = function (nodeData) {
+                if (!this.owner.saved_state || this._suspendSaveState) return;
+                if (!nodeData || !nodeData.instance) return;
+
+                const inst = nodeData.instance;
+                const node = inst.get_node(nodeData.node || nodeData);
+                if (!node) return;
+
+                if (isNodeOrParentsLoading(inst, node)) return;
+
+                if (node.state && node.state.opened) {
+                    this._openSet.add(node.id);
+                } else {
+                    this._openSet.delete(node.id);
+                }
+                this.owner.saved_state[this.rootUrn] = { open: Array.from(this._openSet) };
+            };
+
+            // Bind guards when the container exists; re-bind on SPA remounts
+            function bindGuardsIfReady() {
+                try {
+                    const equipTreeContainer = treeView && treeView.container ? $(treeView.container) : null;
+                    if (!equipTreeContainer || !equipTreeContainer.length) return false;
+                    if (equipTreeContainer.data('__saveStateGuardBound')) return true;
+
+                    let resumeTimer;
+                    equipTreeContainer
+                        .off('.saveStateGuard')
+                        .on('loading.jstree.saveStateGuard', function () {
+                            treeView._suspendSaveState = true;
+                            clearTimeout(resumeTimer);
+                        })
+                        .on('load_node.jstree.saveStateGuard after_open.jstree.saveStateGuard', function () {
+                            clearTimeout(resumeTimer);
+                            resumeTimer = setTimeout(() => { treeView._suspendSaveState = false; }, 200);
+                        });
+
+                    equipTreeContainer.data('__saveStateGuardBound', true);
+                    console.info('[userscript] Bound saveState guards on equipmentTree container');
+                    return true;
+                } catch {
+                    return false;
+                }
+            }
+
+            // Try now, then poll lightly to catch future remounts
+            bindGuardsIfReady();
+            if (treeView.__saveStateGuardPollId) clearInterval(treeView.__saveStateGuardPollId);
+            treeView.__saveStateGuardPollId = setInterval(bindGuardsIfReady, 1000);
+
+            Object.defineProperty(treeView, '__saveStatePatched', { value: true });
+            console.info('[userscript] Patched equipmentTree.treeView.saveState');
         }
+
+        // async function armEquipmentTreeStateTrigger() {
+        //     const treeView = await waitFor(getEquipTree);
+        //     const sm = await waitFor(getStructureManager);
+        //     const app = window.myw?.app;
+
+        //     if (!treeView || !sm || !app) return;
+
+        //     sm.trigger('state-changed', sm.app.currentFeature);
+
+        //     // Try now and re-try periodically to catch SPA remounts
+        //     bindNow();
+        //     if (treeView.__restoreTriggerPollIdV2) clearInterval(treeView.__restoreTriggerPollIdV2);
+        //     treeView.__restoreTriggerPollIdV2 = setInterval(bindNow, 1000);
+        // }
+
+        async function patchStructureManager() {
+            const sm = await waitFor(getStructureManager);
+            if (!sm || sm.__structContentPatched) return;
+
+            const original = sm.structContent;
+            if (typeof original !== 'function') {
+                console.warn('[userscript] structureManager.structContent not a function');
+                return;
+            }
+
+            // Replace with a delegating wrapper (preserves scope of StructContents called within original structContent)
+            sm.structContent = async function (struct, includeProposed = false, layer = undefined) {
+                // Only override when we can compute a sensible layer
+                try {
+                    // const equipTree = getEquipTree();
+                    const structUrn = (struct && struct.type && struct.id) ? (struct.type + '/' + struct.id) : null;
+
+                    let newLayer = layer; // default: keep whatever caller passed
+
+                    // if (equipTree && equipTree.saved_state && structUrn) {
+                        // const ss = equipTree.saved_state[structUrn];
+                        // const openList = Array.isArray(ss?.open) ? ss.open : null;
+
+                        // If caller points at the struct root (or didn't specify a layer),
+                        // redirect to a "deepest recently opened" node when available.
+                        //if ((layer === undefined || layer === structUrn) && openList && openList.length) {
+                            // Heuristic: last opened entry tends to be the deepest after restore
+                            //newLayer = openList[openList.length - 1];
+                            // Uncomment for debug:
+                            //console.log('[userscript] structContent: redirected layer ->', newLayer);
+                        //}
+
+                    if (layer === structUrn) {
+                        newLayer = undefined;
+                        console.log(`[userscript] structContent: redirected layer ${layer} -> ${newLayer}`);
+                    }
+                    // }
+
+                    // Delegate back to the original (keeps the correct StructContents constructor)
+                    return await original.call(this, struct, includeProposed, newLayer);
+                } catch (e) {
+                    console.warn('[userscript] structContent override error; falling back to original', e);
+                    return await original.call(this, struct, includeProposed, layer);
+                }
+            };
+
+            Object.defineProperty(sm, '__structContentPatched', { value: true });
+            console.info('[userscript] Patched structureManager.structContent (delegating, no direct StructContents)');
+        }
+
+        async function applyPatches() {
+            try { 
+                await Promise.all([
+                    patchDisplayManager(), 
+                    patchLocManager(), 
+                    patchEquipmentTreeSaveState(),
+                    patchStructureManager()
+                ]);
+            } catch (e) { 
+                console.error('[userscript] Patching error:', e); 
+            }
+        }
+
+        function start() {
+            if (started) return;
+            started = true;
+            applyPatches();
+        }
+
+        function stop() {
+            if (!started) return;
+            started = false;
+            
+            // Clean up retry interval
+            if (saveStatePatchRetryId) {
+                clearInterval(saveStatePatchRetryId);
+                saveStatePatchRetryId = null;
+            }
+            
+            // Clean up tree view polling
+            const treeView = getEquipTreeView();
+            if (treeView && treeView.__saveStateGuardPollId) {
+                clearInterval(treeView.__saveStateGuardPollId);
+                treeView.__saveStateGuardPollId = null;
+            }
+        }
+
+        // // Re-apply on SPA URL changes
+        // let lastHref = location.href;
+        // setInterval(() => {
+        //     if (lastHref !== location.href) {
+        //         lastHref = location.href;
+        //         applyPatches();
+        //     }
+        // }, 1000);
+
+        // // Light DOM-change heuristic for remounts
+        // const mo = new MutationObserver(() => {
+        //     if (!getDisplayManager() || !getLocManager()) return;
+        //     applyPatches();
+        // });
+        // mo.observe(document.documentElement, { childList: true, subtree: true });
+        return { start, stop };
+    })();
+
+    // Route-based feature loading
+    if (IS_LOGIN) {
+        const autoLoginFeature = FEATURE_TOGGLES.find(f => f.label === "Auto Login");
+        if (autoLoginFeature) {
+            featureManager.register(autoLoginFeature.label, { start: handleAutoLogin }, { defaultState: autoLoginFeature.defaultState });
+        }
+        featureManager.init();
+        return;
     }
 
-    applyPatches();
+    if (IS_CONFIG) {
+        runConfigEnhancements();
+        return;
+    }
 
-    // // Re-apply on SPA URL changes
-    // let lastHref = location.href;
-    // setInterval(() => {
-    //     if (lastHref !== location.href) {
-    //         lastHref = location.href;
-    //         applyPatches();
-    //     }
-    // }, 1000);
+    if (!IS_MYWCOM) {
+        return;
+    }
 
-    // // Light DOM-change heuristic for remounts
-    // const mo = new MutationObserver(() => {
-    //     if (!getDisplayManager() || !getLocManager()) return;
-    //     applyPatches();
-    // });
-    // mo.observe(document.documentElement, { childList: true, subtree: true });
+    // Load each feature through the feature manager for /mywcom
+    // Register features with their default states
+    FEATURE_TOGGLES.forEach(feature => {
+        const handlers = {
+            "Auto Login": { start: handleAutoLogin },
+            "Design Changes": { start: enableXhrIntercept, stop: disableXhrIntercept },
+            "Notifications": { start: startNotificationsPoll, stop: stopNotificationsPoll },
+            "Details Popup": { start: () => featureDetailsPopup.observe(), stop: () => featureDetailsPopup.stop() },
+            "Auto Terminations": { 
+                start: () => { enableXhrIntercept(); featureBetterTerminations.setupMutationObserver(); featureBetterTerminations.setupTreeListeners(); }, 
+                stop: () => { featureBetterTerminations.stopObserving(); disableXhrIntercept(); } 
+            },
+            "Error Monitor": { start: () => errorMonitorFeature.start(), stop: () => errorMonitorFeature.stop() },
+            "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() }
+        };
+        
+        featureManager.register(feature.label, handlers[feature.label] || {}, { defaultState: feature.defaultState });
+    });
+    featureManager.init();
+
+    featureHorizontalMenu.run();
 })();
-
 
 /*
 For tables in Config
@@ -3024,9 +3986,6 @@ th.ant-table-column-has-sorters
 
 // TODO
 /*
-calculator
-    * replace dialog with floating popup from copy feature
-    * validate input
 
 splice group
     * fix formatting so cable pairs are a list
