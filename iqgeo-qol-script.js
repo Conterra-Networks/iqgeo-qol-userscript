@@ -2773,8 +2773,8 @@
                 const data = await response.json();
                 return data;
             } catch (error) {
-                logger.error(FEATURE_NAME, `Error fetching data from ${url}:`, error);
-                throw error; // Rethrow the error so it can be handled by the caller
+                // Don't log here - let the caller (fetchRange) handle logging for single-strand failures only
+                throw error;
             } finally {
                 timeout?.clear();
             }
@@ -3993,3 +3993,4 @@ splice group
     * determine why cable pairs are not grouped (inspect object map)
 
 */
+
