@@ -12,6 +12,7 @@
         { label: "Design Changes", description: "Highlights pending splice changes in the current design", defaultState: "on", hidden: false },
         { label: "Details Popup", description: "View the active Details content in a draggable popup", defaultState: "on", hidden: false },
         { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
+        { label: "Restore Panel Width", description: "Remembers the left panel width across page reloads", defaultState: "on", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
         { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "off", hidden: true },
         { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
@@ -2773,8 +2774,8 @@
                 const data = await response.json();
                 return data;
             } catch (error) {
-                logger.error(FEATURE_NAME, `Error fetching data from ${url}:`, error);
-                throw error; // Rethrow the error so it can be handled by the caller
+                // Don't log here - let the caller (fetchRange) handle logging for single-strand failures only
+                throw error;
             } finally {
                 timeout?.clear();
             }
@@ -3913,6 +3914,195 @@
         return { start, stop };
     })();
 
+    // Panel Width Persistence: Save and restore left panel width across page reloads
+    const panelWidthPersistence = (() => {
+        let started = false;
+        let resizeObserver = null;
+        let innerCenterObserver = null;
+        let saveTimeout = null;
+        const STORAGE_KEY = 'qol-west-pane-width';
+        const SAVE_DELAY_MS = 500;
+
+        function saveWidth(width) {
+            const numWidth = typeof width === 'number' ? width : parseInt(width, 10);
+            if (numWidth > 0) {
+                localStorage.setItem(STORAGE_KEY, numWidth.toString());
+            }
+        }
+
+        function getSavedWidth() {
+            const saved = localStorage.getItem(STORAGE_KEY);
+            return saved ? parseInt(saved, 10) : null;
+        }
+
+        function restoreWidth() {
+            const westPane = document.querySelector('div#left-content');
+            const resizer = document.querySelector('.ui-layout-resizer-west');
+            const outerCenter = document.querySelector('#layout-map-view');
+            const innerCenter = document.querySelector('div#right-content');
+            const container = document.querySelector('.ui-layout-container');
+            const savedWidth = getSavedWidth();
+            
+            // Check if all required elements are present
+            if (!westPane || !resizer || !outerCenter || !innerCenter || !container || !savedWidth) {
+                return false;
+            }
+            
+            try {
+                // Set west pane width
+                westPane.style.width = savedWidth + 'px';
+                
+                // Update resizer position
+                resizer.style.left = savedWidth + 'px';
+                
+                // Update outer center pane
+                const resizerWidth = resizer.offsetWidth || 3;
+                const centerLeft = savedWidth + resizerWidth;
+                outerCenter.style.left = centerLeft + 'px';
+                outerCenter.style.width = (container.offsetWidth - centerLeft) + 'px';
+                
+                // Remove width and setup guard for inner center
+                innerCenter.style.width = '';
+                setupInnerCenterWidthGuard(innerCenter);
+                
+                // Trigger resize
+                if (window.jQuery) {
+                    window.jQuery(window).trigger('resize');
+                }
+                
+                return true;
+            } catch (e) {
+                console.error('[userscript] Panel width restore error:', e);
+                return false;
+            }
+        }
+
+        function attemptRestoreWithRetry() {
+            const savedWidth = getSavedWidth();
+            if (!savedWidth) return;
+            
+            let attempts = 0;
+            const maxAttempts = 20; // Try for up to 10 seconds
+            const retryInterval = 500;
+            
+            const tryRestore = () => {
+                attempts++;
+                
+                // Try to restore
+                const success = restoreWidth();
+                
+                if (success) {
+                    // Verify it actually applied
+                    const westPane = document.querySelector('div#left-content');
+                    const actualWidth = westPane ? parseInt(westPane.style.width, 10) : 0;
+                    
+                    if (actualWidth === savedWidth) {
+                        // Success! Stop retrying
+                        return;
+                    }
+                }
+                
+                // Retry if we haven't hit max attempts
+                if (attempts < maxAttempts) {
+                    setTimeout(tryRestore, retryInterval);
+                }
+            };
+            
+            // Start trying after a short initial delay
+            setTimeout(tryRestore, 1000);
+        }
+
+        function setupInnerCenterWidthGuard(innerCenter) {
+            if (!innerCenter) return;
+            
+            if (innerCenterObserver) {
+                innerCenterObserver.disconnect();
+            }
+            
+            // Continuously remove width style if app tries to set it
+            innerCenterObserver = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'style' && innerCenter.style.width) {
+                        innerCenter.style.width = '';
+                    }
+                });
+            });
+            
+            innerCenterObserver.observe(innerCenter, {
+                attributes: true,
+                attributeFilter: ['style']
+            });
+        }
+
+        function setupResizeMonitoring() {
+            const westPane = document.querySelector('div#left-content');
+            if (!westPane) return false;
+
+            // Monitor west pane for resize and save width
+            resizeObserver = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'style') {
+                        const currentWidth = westPane.style.width;
+                        if (currentWidth) {
+                            clearTimeout(saveTimeout);
+                            saveTimeout = setTimeout(() => {
+                                saveWidth(currentWidth);
+                            }, SAVE_DELAY_MS);
+                        }
+                    }
+                });
+            });
+
+            resizeObserver.observe(westPane, {
+                attributes: true,
+                attributeFilter: ['style']
+            });
+
+            // Setup inner center width guard
+            const innerCenter = document.querySelector('div#right-content');
+            if (innerCenter) {
+                setupInnerCenterWidthGuard(innerCenter);
+            }
+
+            return true;
+        }
+
+        function start() {
+            if (started) return;
+            started = true;
+
+            runWhenReady('div#left-content', () => {
+                // Use retry logic for reliable restoration
+                attemptRestoreWithRetry();
+                
+                // Setup monitoring
+                setupResizeMonitoring();
+            });
+        }
+
+        function stop() {
+            if (!started) return;
+            started = false;
+
+            if (resizeObserver) {
+                resizeObserver.disconnect();
+                resizeObserver = null;
+            }
+
+            if (innerCenterObserver) {
+                innerCenterObserver.disconnect();
+                innerCenterObserver = null;
+            }
+
+            if (saveTimeout) {
+                clearTimeout(saveTimeout);
+                saveTimeout = null;
+            }
+        }
+
+        return { start, stop };
+    })();
+
     // Route-based feature loading
     if (IS_LOGIN) {
         const autoLoginFeature = FEATURE_TOGGLES.find(f => f.label === "Auto Login");
@@ -3944,6 +4134,7 @@
                 start: () => { enableXhrIntercept(); featureBetterTerminations.setupMutationObserver(); featureBetterTerminations.setupTreeListeners(); }, 
                 stop: () => { featureBetterTerminations.stopObserving(); disableXhrIntercept(); } 
             },
+            "Restore Panel Width": { start: () => panelWidthPersistence.start(), stop: () => panelWidthPersistence.stop() },
             "Error Monitor": { start: () => errorMonitorFeature.start(), stop: () => errorMonitorFeature.stop() },
             "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() }
         };
