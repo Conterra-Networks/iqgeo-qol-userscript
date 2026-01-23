@@ -531,12 +531,15 @@
         }
 
         try {
-            // Check URL for manhole (UUB) structure
+            // DEPRECATED: XHR intercept for manhole structure (Design Changes feature)
+            // Now handled by patchAddPinConnectionInfo in Plugin Patches
+            /*
             match = normalizedUrl.pathname.match(/\/structure\/manhole\/(\d+)\/contents/);
             if (match && featureManager.isEnabled("Design Changes")) {
                 withInterceptPaused(() => featurePendingSpliceChanges.processManholeData(url));
                 return;
             }
+            */
 
             // Check URL for route contents
             const regexRouteContents = /\/modules\/comms\/route\/.*\/(\d+)\/contents/;
@@ -621,12 +624,15 @@
         };
     }
 
-    // Feature - Pending Splice Changes
+    // Feature - Pending Splice Changes (DEPRECATED - Migrated to Plugin Patches)
     // What: indicate splice changes of current design
     // Why:  proposed changes of an open design appear the same as published changes which can cause confusion
     // How:  XHR listener to intercept splice details when a structure containing splices is selected
     //       Mutation Observer to add pending splice count to cable groups header
     //       Click event listener to update style of pending splices when splice list is toggled
+    // MIGRATION: This feature is now integrated into pluginOverridesFeature (patchAddPinConnectionInfo)
+    // TODO: Remove after stable migration period (~2 weeks)
+    /*
     let jsonData = {};
     let changedFeatures = [];
     let currentDeltaId = null;
@@ -667,7 +673,7 @@
 
                 // Note: Removing delta value from URL allows us to obtain changes of currently open design.
                 // If the structure only exists in the proposed delta, the base URL will 404; fall back to the original URL.
-                const baseURL = url.replace(/&?delta=.*/, "");
+                const baseURL = url.replace(/&?delta=.*\/, "");  // Escaped regex to avoid breaking block comment
                 let response = await fetch(baseURL);
                 if (response.status === 404) {
                     response = await fetch(url);
@@ -716,8 +722,12 @@
             processManholeData
         };
     })();
+    */
 
     // todo: use mutation observer instead
+    /*
+    // DEPRECATED: jQuery click handler for Design Changes feature
+    // TODO: Migrate white fiber symbol fix to jstree event binding
     if (IS_MYWCOM) {
         $("#myWorldApp").on("click", 'div[id="related-equipment-tree-container"] i[class="jstree-icon jstree-ocl"]', function () {
             // if (!isToggleButtonOn("Design Changes")) {
@@ -835,6 +845,7 @@
             });
         });
     }
+    */
 
     // Feature - Details Popup
     var featureDetailsPopup = (function () {
@@ -3629,10 +3640,236 @@
             }
         };
 
+        let addPinConnectionPatchRetryId = null;
+
+        async function patchAddPinConnectionInfo() {
+            // Try with a reasonable initial timeout
+            let treeView;
+            try {
+                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
+            } catch (e) {
+                // If initial attempt fails, set up periodic retry
+                if (!addPinConnectionPatchRetryId) {
+                    console.info('[userscript] EquipTreeView not found for _addPinConnectionInfo patch, will retry periodically...');
+                    addPinConnectionPatchRetryId = setInterval(() => {
+                        const tv = getEquipTreeView();
+                        if (tv && !tv.__addPinConnectionInfoPatched) {
+                            clearInterval(addPinConnectionPatchRetryId);
+                            addPinConnectionPatchRetryId = null;
+                            patchAddPinConnectionInfo(); // Retry the patch
+                        }
+                    }, 5000); // Check every 5 seconds
+                }
+                return;
+            }
+
+            if (!treeView || treeView.__addPinConnectionInfoPatched) return;
+
+            const original_addPinConnectionInfo = treeView._addPinConnectionInfo;
+            if (typeof original_addPinConnectionInfo !== 'function') {
+                console.warn('[userscript] equipmentTree.treeView._addPinConnectionInfo not a function');
+                return;
+            }
+
+            treeView._addPinConnectionInfo = function(pinNodes, conns, cable, color2) {
+                // When toggle OFF, use original IQGeo behavior
+                if (!featureManager.isEnabled("Design Changes")) {
+                    return original_addPinConnectionInfo.call(this, pinNodes, conns, cable, color2);
+                }
+                
+                for (const conn of conns) {
+                    // QOL patch: Normalize delta location - copy from alternate location if needed
+                    const hasAltDelta = !conn.delta && conn.conn_rec?._myw?.delta;
+                    if (hasAltDelta) {
+                        conn.delta = conn.conn_rec._myw.delta;
+                        
+                        // Generate deltaTitle if not available: "design/NAME" -> "Design: NAME"
+                        if (conn.conn_rec._myw.delta_owner_title) {
+                            conn.deltaTitle = conn.conn_rec._myw.delta_owner_title;
+                        } else if (conn.delta && conn.delta.startsWith('design/')) {
+                            conn.deltaTitle = 'Design: ' + conn.delta.replace('design/', '');
+                        }
+                        
+                        // Override isProposed() to return true for normalized deltas
+                        if (!conn.__isProposedPatched) {
+                            const originalIsProposed = conn.isProposed.bind(conn);
+                            conn.isProposed = function() {
+                                const original = originalIsProposed();
+                                // Return true if we have a delta (normalized or original)
+                                return original || !!conn.delta;
+                            };
+                            conn.__isProposedPatched = true;
+                        }
+                    }
+                    
+                    // Determine colours for highlights
+                    const fromCableColor = conn.from_cable === cable ? undefined : color2;
+                    const toCableColor = !cable || conn.to_cable === cable ? undefined : color2;
+                    const currentDelta = this.ds.getDelta();
+
+                    // Build highlights
+                    const fromGeomRep = this.geomRepForCable(
+                        conn.from_cable,
+                        conn.from_feature,
+                        conn.from_cable_side,
+                        fromCableColor
+                    );
+                    const toGeomRep = this.geomRepForCable(
+                        conn.to_cable,
+                        conn.to_feature,
+                        conn.to_cable_side,
+                        toCableColor
+                    );
+
+                    // Update nodes for connection (avoiding problems with broken data)
+                    for (let pin = conn.from_pins.low; pin <= conn.from_pins.high; pin++) {
+                        const node = pinNodes[pin];
+
+                        // Check for broken data
+                        if (!node) {
+                            console.warn(`equipmentTree: No node for pin ${pin}`);
+                            continue;
+                        }
+
+                        // Check for already added (can happen with bi-directional cables)
+                        if (node.conn && node.conn.urn === conn.urn) continue;
+
+                        // for handling if connection is in both master and one or more designs (gazumped)
+                        const gazumped = node.conn && conn.delta && conn.delta !== currentDelta;
+                        if (!gazumped) node.conn = conn;
+
+                        node.text += this.displayManager.connLabel(pin, conn);
+
+                        // Mark all connections with delta as proposed
+                        if (conn.delta) {
+                            if (!gazumped) node.proposed = true;
+                            node.highlight = null;
+                            node.highlight2 = null;
+                            node.link = conn.delta;
+                            continue;
+                        }
+
+                        node.highlight = fromGeomRep;
+                        node.highlight2 = toGeomRep;
+                    }
+                }
+            };
+
+            Object.defineProperty(treeView, '__addPinConnectionInfoPatched', { value: true });
+            console.info('[userscript] Patched equipmentTree.treeView._addPinConnectionInfo');
+        }
+
 
         async function patchDisplayManager() {
             const dm = await waitFor(getDisplayManager);
             if (!dm || dm.__connLabelPatchedSimple) return;
+
+            // Override _proposedText to conditionally use different color for current delta
+            const original_proposedText = dm._proposedText;
+            dm._proposedText = function(text, deltaDesc = null, conn = null) {
+                // When toggle OFF, use original IQGeo behavior
+                if (!featureManager.isEnabled("Design Changes")) {
+                    return original_proposedText.call(this, text, deltaDesc);
+                }
+                
+                // Feature enabled - highlight current delta differently
+                const currentDelta = window.myw?.app?.getDelta() || '';
+                let isCurrentDelta = false;
+                if (conn && conn.delta && currentDelta) {
+                    isCurrentDelta = conn.delta === currentDelta;
+                }
+                const color = isCurrentDelta ? "#20b94b" : this.proposedObjectStyle.color;
+
+                let html = `<span style="color:${color};"> ${text} </span>`;
+
+                if (deltaDesc) {
+                    html += `<span class="design-link" style="color:${color};" > [${deltaDesc}] </span>`;
+                }
+
+                return html;
+            };
+
+            // Override spliceLabel to show proposed connection count
+            const originalSpliceLabel = dm.spliceLabel;
+            dm.spliceLabel = function(splice) {
+                // When toggle OFF, use original IQGeo behavior
+                if (!featureManager.isEnabled("Design Changes")) {
+                    return originalSpliceLabel.call(this, splice);
+                }
+                
+                const currentDelta = window.myw?.app?.getDelta() || '';
+                
+                // Get total count and proposed count
+                let count = 0;
+                let proposedCount = 0;
+                for (const conn of splice.conns) {
+                    const connCount = conn.from_pins.size;
+                    count += connCount;
+                    
+                    // Normalize delta if needed (same as in _addPinConnectionInfo)
+                    if (!conn.delta && conn.conn_rec?._myw?.delta) {
+                        conn.delta = conn.conn_rec._myw.delta;
+                        if (conn.conn_rec._myw.delta_owner_title) {
+                            conn.deltaTitle = conn.conn_rec._myw.delta_owner_title;
+                        } else if (conn.delta && conn.delta.startsWith('design/')) {
+                            conn.deltaTitle = 'Design: ' + conn.delta.replace('design/', '');
+                        }
+                        
+                        // Override isProposed() to return true for normalized deltas
+                        if (!conn.__isProposedPatched) {
+                            const originalIsProposed = conn.isProposed.bind(conn);
+                            conn.isProposed = function() {
+                                return originalIsProposed() || !!conn.delta;
+                            };
+                            conn.__isProposedPatched = true;
+                        }
+                    }
+                    
+                    // Check if proposed AND in current delta
+                    const isConnProposed = (conn.isProposed && conn.isProposed()) || !!conn.delta;
+                    const isCurrentDelta = conn.delta === currentDelta;
+                    if (isConnProposed && isCurrentDelta) {
+                        proposedCount += connCount;
+                    }
+                }
+
+                // Build label
+                const from = splice.from_cable.properties.name;
+                const to = splice.to_cable.properties.name;
+                let text = `${this.msg('splice')}: ${from} -> ${to} (${count})`;
+                
+                // Add proposed count if any
+                if (proposedCount > 0) {
+                    text += ` <span style="color: #20b94b; margin-left: 8px;">[${proposedCount} Pending]</span>`;
+                }
+
+                if (splice.proposed) {
+                    return this._proposedText(text, splice.deltaTitle);
+                }
+
+                return text;
+            };
+
+            // Override connLabel to show both pin details AND delta info for proposed connections
+            const originalConnLabel = dm.connLabel;
+            dm.connLabel = function(pin, conn) {
+                // When toggle OFF, use original IQGeo behavior
+                if (!featureManager.isEnabled("Design Changes")) {
+                    return originalConnLabel.call(this, pin, conn);
+                }
+                
+                // Get the detailed pin info
+                const baseLabel = this._connLabel(pin, conn);
+                
+                // If proposed, append delta info
+                if (conn.isProposed && conn.isProposed()) {
+                    const deltaDesc = conn.deltaTitle || (conn.delta ? conn.delta.replace('design/', 'Design: ') : '');
+                    const proposedText = this._proposedText ? this._proposedText(baseLabel, deltaDesc, conn) : `${baseLabel} (${deltaDesc})`;
+                    return proposedText;
+                }
+                
+                return baseLabel;
+            };
 
             // Use a normal function to preserve `this` so calls to this.msg / this.getColorHTMLFor work
             dm._connLabel = function (pin, conn) {
@@ -3671,7 +3908,7 @@
             };
 
             Object.defineProperty(dm, '__connLabelPatchedSimple', { value: true });
-            console.info('[userscript] Patched displayManager._connLabel');
+            console.info('[userscript] Patched displayManager._connLabel, _proposedText, connLabel, and spliceLabel');
         }
 
         async function patchLocManager() {
@@ -3865,7 +4102,8 @@
                     patchDisplayManager(), 
                     patchLocManager(), 
                     patchEquipmentTreeSaveState(),
-                    patchStructureManager()
+                    patchStructureManager(),
+                    patchAddPinConnectionInfo()
                 ]);
             } catch (e) { 
                 console.error('[userscript] Patching error:', e); 
@@ -3882,10 +4120,15 @@
             if (!started) return;
             started = false;
             
-            // Clean up retry interval
+            // Clean up retry intervals
             if (saveStatePatchRetryId) {
                 clearInterval(saveStatePatchRetryId);
                 saveStatePatchRetryId = null;
+            }
+            
+            if (addPinConnectionPatchRetryId) {
+                clearInterval(addPinConnectionPatchRetryId);
+                addPinConnectionPatchRetryId = null;
             }
             
             // Clean up tree view polling
@@ -4127,7 +4370,10 @@
     FEATURE_TOGGLES.forEach(feature => {
         const handlers = {
             "Auto Login": { start: handleAutoLogin },
-            "Design Changes": { start: enableXhrIntercept, stop: disableXhrIntercept },
+            // Design Changes: Now integrated into Plugin Patches feature
+            // Toggle only affects visual indicators (runtime checks in patches)
+            // No separate start/stop needed - patches remain active for delta normalization
+            "Design Changes": { start: () => {}, stop: () => {} },
             "Notifications": { start: startNotificationsPoll, stop: stopNotificationsPoll },
             "Details Popup": { start: () => featureDetailsPopup.observe(), stop: () => featureDetailsPopup.stop() },
             "Auto Terminations": { 
