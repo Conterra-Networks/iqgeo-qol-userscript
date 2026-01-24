@@ -3198,18 +3198,22 @@
 
 
     
-// Error Monitor
+    // Error Monitor
     const errorMonitorFeature = (() => {
         let started = false;
+        let interceptorsInstalled = false;
+        let uiInitialized = false;
         let cleanupFns = [];
         let uiObserver = null;
         let footerObserver = null;
+        let debugFallbackTimeout = null;
         let wrapper = null;
         let btn = null;
         let panel = null;
         let panelOpen = false;
         let currentFilter = 'all';
         const logs = [];
+        let debugLogging = false; // Enable if UI fails to initialize
         const IGNORE_URL_PATTERNS = [
             /googleapis\.com\/maps\/api\/mapsjs\//,
             /optical_node_closure_spec/
@@ -3218,6 +3222,12 @@
             /\/modules\/comms\/structure\/manhole\// // expected 404 when structure exists only in delta
         ];
         const LEGACY_BUTTON_POS_KEY = 'qol-errmon-btn-pos'; // Implemented 2026-01-13. To be removed at a later date
+
+        function debugLog(...args) {
+            if (debugLogging) {
+                console.log('[ErrorMonitor]', ...args);
+            }
+        }
 
         function purgeLegacyErrorMonitorState() {
             try {
@@ -3249,6 +3259,7 @@
         function addLog(entry) {
             if (shouldIgnoreLog(entry)) return;
             logs.push({ time: new Date(), ...entry });
+            debugLog('Log added:', entry.type, entry.message?.substring(0, 50));
             if (panelOpen) renderLogs(currentFilter);
             updateButtonColor();
         }
@@ -3344,6 +3355,7 @@
         }
 
         function teardownUi() {
+            debugLog('Tearing down UI');
             if (uiObserver) {
                 uiObserver.disconnect();
                 uiObserver = null;
@@ -3362,223 +3374,323 @@
             btn = null;
             panel = null;
             panelOpen = false;
+            uiInitialized = false;
+        }
+
+        function installInterceptors() {
+            if (interceptorsInstalled) {
+                debugLog('Interceptors already installed');
+                return;
+            }
+            
+            debugLog('Installing error interceptors');
+            
+            // Intercept console.error
+            ['error'].forEach((level) => {
+                const orig = console[level];
+                console[level] = function (...args) {
+                    addLog({ type: 'console', level, message: args.map(String).join(' ') });
+                    orig.apply(console, args);
+                };
+                cleanupFns.push(() => { console[level] = orig; });
+            });
+
+            // Intercept window errors
+            const errListener = (e) => {
+                addLog({ type: 'console', level: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
+            };
+            const rejListener = (e) => {
+                addLog({ type: 'console', level: 'error', message: 'UnhandledRejection: ' + (e.reason?.toString() || e.reason) });
+            };
+            window.addEventListener('error', errListener);
+            window.addEventListener('unhandledrejection', rejListener);
+            cleanupFns.push(() => {
+                window.removeEventListener('error', errListener);
+                window.removeEventListener('unhandledrejection', rejListener);
+            });
+
+            // Intercept fetch
+            const origFetch = window.fetch;
+            window.fetch = function (...args) {
+                return origFetch.apply(this, args).then((res) => {
+                    const url = res?.url || args[0] || '';
+                    if (!res.ok) {
+                        if (!(res.status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
+                            addLog({ type: 'network', method: 'fetch', status: res.status, url, message: `${res.status} ${res.statusText}` });
+                        }
+                    }
+                    return res;
+                }).catch((err) => {
+                    addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: err.toString() });
+                    throw err;
+                });
+            };
+            cleanupFns.push(() => { window.fetch = origFetch; });
+
+            // Intercept XMLHttpRequest
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+                this._errmon = { method, url };
+                return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function (...args) {
+                this.addEventListener('loadend', () => {
+                    const { status, statusText } = this;
+                    const url = this._errmon.url;
+                    if (status < 200 || status >= 300) {
+                        if (!(status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
+                            addLog({ type: 'network', method: this._errmon.method, status, url, message: `${status} ${statusText}` });
+                        }
+                    }
+                });
+                this.addEventListener('error', () => {
+                    addLog({ type: 'network', method: this._errmon.method, status: 'ERR', url: this._errmon.url, message: 'XHR error' });
+                });
+                return origSend.apply(this, args);
+            };
+            cleanupFns.push(() => {
+                XMLHttpRequest.prototype.open = origOpen;
+                XMLHttpRequest.prototype.send = origSend;
+            });
+
+            interceptorsInstalled = true;
+            debugLog('Interceptors installed successfully');
+        }
+
+        function initializeUI() {
+            if (uiInitialized) {
+                debugLog('UI already initialized');
+                return;
+            }
+            
+            debugLog('Initializing UI components');
+            cleanupFns.push(teardownUi);
+            
+            // Create footer button icon
+            btn = document.createElement('span');
+            btn.title = 'Error Monitor';
+            btn.style.cursor = 'pointer';
+            
+            // Create SVG alert icon (initial state)
+            btn.innerHTML = '';
+            updateButtonColor();
+
+            // Create panel
+            panel = document.createElement('div');
+            Object.assign(panel.style, {
+                position: 'fixed', width: '400px', maxHeight: '60vh', background: '#fff', 
+                border: '1px solid #888', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', 
+                fontSize: '12px', display: 'none', zIndex: 99999,
+                overflow: 'hidden'
+            });
+
+            // Position panel near bottom-right with viewport-aware boundary checks
+            var positionErrorPanel = function() {
+                if (!panel) {
+                    return;
+                }
+                // Desired offsets matching previous behavior
+                var desiredBottom = 30; // px
+                var desiredRight = 10;  // px
+
+                var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                // Panel is constrained to 60% of viewport height
+                var maxPanelHeight = vh * 0.6;
+
+                // Ensure bottom offset plus max height does not exceed viewport
+                if (desiredBottom + maxPanelHeight > vh) {
+                    desiredBottom = Math.max(10, vh - maxPanelHeight - 10);
+                }
+
+                panel.style.bottom = desiredBottom + 'px';
+                panel.style.right = desiredRight + 'px';
+            };
+
+            // Initial positioning and keep responsive on resize
+            positionErrorPanel();
+            window.addEventListener('resize', positionErrorPanel);
+            
+            const header = document.createElement('div');
+            Object.assign(header.style, {
+                padding: '8px',
+                borderBottom: '1px solid #ccc',
+                background: '#f5f5f5'
+            });
+            header.innerHTML = `
+                <button data-filter="all">All</button>
+                <button data-filter="console">Console</button>
+                <button data-filter="network">Network</button>
+                <button id="err-clear" style="float:right">Clear</button>
+                <hr style="margin-top: 8px; margin-bottom: 0;"/>
+            `;
+            panel.appendChild(header);
+
+            const list = document.createElement('ul');
+            Object.assign(list.style, { 
+                padding: '8px', 
+                paddingRight: '16px',
+                listStyle: 'none',
+                margin: '0',
+                maxHeight: 'calc(60vh - 60px)',
+                overflowY: 'auto',
+                overflowX: 'hidden'
+            });
+            panel.appendChild(list);
+
+            btn.addEventListener('click', () => {
+                panelOpen = !panelOpen;
+                panel.style.display = panelOpen ? 'block' : 'none';
+                if (panelOpen) {
+                    renderLogs(currentFilter);
+                }
+            });
+
+            header.querySelectorAll('button[data-filter]').forEach((fb) => {
+                fb.addEventListener('click', () => {
+                    currentFilter = fb.dataset.filter;
+                    renderLogs(currentFilter);
+                });
+            });
+            header.querySelector('#err-clear').addEventListener('click', () => {
+                logs.length = 0;
+                updateButtonColor();
+                renderLogs(currentFilter);
+            });
+
+            const injectUi = () => {
+                const footerRight = document.getElementById('footer-right');
+                if (!footerRight) {
+                    debugLog('footer-right not found, waiting...');
+                    return false;
+                }
+                
+                debugLog('Injecting UI into footer-right');
+                
+                // Create wrapper span with same structure as other footer elements
+                wrapper = document.createElement('span');
+                const iconSpan = document.createElement('span');
+                iconSpan.className = 'plugin-icon';
+                iconSpan.appendChild(btn);
+                
+                const messageSpan = document.createElement('span');
+                messageSpan.className = 'plugin-message';
+                
+                wrapper.appendChild(iconSpan);
+                wrapper.appendChild(messageSpan);
+                
+                // Insert as first child in footer-right
+                footerRight.insertBefore(wrapper, footerRight.firstChild);
+                
+                // Append panel to body
+                document.body.appendChild(panel);
+                
+                debugLog('UI successfully injected, monitoring active with', logs.length, 'logs captured');
+                uiInitialized = true;
+                
+                // Clear the debug fallback timeout since UI initialized successfully
+                if (debugFallbackTimeout) {
+                    clearTimeout(debugFallbackTimeout);
+                    debugFallbackTimeout = null;
+                }
+                
+                // Watch for new elements being added to footer and keep error monitor at start
+                footerObserver = new MutationObserver(() => {
+                    if (wrapper && wrapper.parentNode === footerRight) {
+                        // Only reposition if we're not already first
+                        if (footerRight.firstChild !== wrapper) {
+                            footerRight.insertBefore(wrapper, footerRight.firstChild);
+                        }
+                    }
+                });
+                footerObserver.observe(footerRight, { childList: true });
+                
+                return true;
+            };
+
+            if (!injectUi()) {
+                debugLog('Starting MutationObserver to watch for footer-right');
+                uiObserver = new MutationObserver((mutations, obs) => {
+                    if (injectUi()) {
+                        debugLog('footer-right appeared, UI injected via observer');
+                        obs.disconnect();
+                    }
+                });
+                uiObserver.observe(document.documentElement, { childList: true, subtree: true });
+                
+                // Fallback: Enable debug logging if UI doesn't appear within 15 seconds
+                debugFallbackTimeout = setTimeout(() => {
+                    if (!uiInitialized) {
+                        debugLogging = true;
+                        console.warn('[ErrorMonitor] UI failed to initialize after 15s, debug logging enabled');
+                        console.log('[ErrorMonitor] Captured', logs.length, 'log entries');
+                        if (logs.length > 0) {
+                            console.log('[ErrorMonitor] Most recent logs:');
+                            logs.slice(-5).forEach(log => {
+                                console.log(`  [${formatTime(log.time)}] ${log.type}/${log.level || log.method}: ${log.message}`);
+                            });
+                        }
+                    }
+                    debugFallbackTimeout = null;
+                }, 15000);
+            } else {
+                debugLog('UI injected immediately');
+            }
         }
 
         function start() {
-            if (started) return;
+            if (started) {
+                debugLog('Already started, skipping');
+                return;
+            }
+            debugLog('Feature start() called');
             started = true;
-            runWhenReady('#map_canvas', () => {
-                cleanupFns.push(teardownUi);
-
-                ['error'].forEach((level) => {
-                    const orig = console[level];
-                    console[level] = function (...args) {
-                        addLog({ type: 'console', level, message: args.map(String).join(' ') });
-                        orig.apply(console, args);
+            
+            // Phase 1: Install interceptors immediately to capture errors from page load
+            installInterceptors();
+            
+            // Phase 2: Initialize UI when DOM is ready (deferred)
+            // Try immediately first, then fall back to waiting
+            if (document.getElementById('footer-right')) {
+                debugLog('footer-right already exists, initializing UI immediately');
+                initializeUI();
+            } else {
+                debugLog('Waiting for DOM to be ready for UI injection');
+                // Wait for DOM ready
+                if (document.readyState === 'loading') {
+                    const domReadyHandler = () => {
+                        debugLog('DOMContentLoaded fired, attempting UI initialization');
+                        setTimeout(() => initializeUI(), 100); // Small delay to let IQGeo app initialize
                     };
-                    cleanupFns.push(() => { console[level] = orig; });
-                });
-
-                const errListener = (e) => {
-                    addLog({ type: 'console', level: 'error', message: `${e.message} (${e.filename}:${e.lineno})` });
-                };
-                const rejListener = (e) => {
-                    addLog({ type: 'console', level: 'error', message: 'UnhandledRejection: ' + (e.reason?.toString() || e.reason) });
-                };
-                window.addEventListener('error', errListener);
-                window.addEventListener('unhandledrejection', rejListener);
-                cleanupFns.push(() => {
-                    window.removeEventListener('error', errListener);
-                    window.removeEventListener('unhandledrejection', rejListener);
-                });
-
-                const origFetch = window.fetch;
-                window.fetch = function (...args) {
-                    return origFetch.apply(this, args).then((res) => {
-                        const url = res?.url || args[0] || '';
-                        if (!res.ok) {
-                            if (!(res.status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
-                                addLog({ type: 'network', method: 'fetch', status: res.status, url, message: `${res.status} ${res.statusText}` });
-                            }
-                        }
-                        return res;
-                    }).catch((err) => {
-                        addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: err.toString() });
-                        throw err;
-                    });
-                };
-                cleanupFns.push(() => { window.fetch = origFetch; });
-
-                const origOpen = XMLHttpRequest.prototype.open;
-                const origSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-                    this._errmon = { method, url };
-                    return origOpen.call(this, method, url, ...rest);
-                };
-                XMLHttpRequest.prototype.send = function (...args) {
-                    this.addEventListener('loadend', () => {
-                        const { status, statusText } = this;
-                        const url = this._errmon.url;
-                        if (status < 200 || status >= 300) {
-                            if (!(status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
-                                addLog({ type: 'network', method: this._errmon.method, status, url, message: `${status} ${statusText}` });
-                            }
-                        }
-                    });
-                    this.addEventListener('error', () => {
-                        addLog({ type: 'network', method: this._errmon.method, status: 'ERR', url: this._errmon.url, message: 'XHR error' });
-                    });
-                    return origSend.apply(this, args);
-                };
-                cleanupFns.push(() => {
-                    XMLHttpRequest.prototype.open = origOpen;
-                    XMLHttpRequest.prototype.send = origSend;
-                });
-
-                // Create footer button icon
-                btn = document.createElement('span');
-                btn.title = 'Error Monitor';
-                btn.style.cursor = 'pointer';
-                
-                // Create SVG alert icon (initial state)
-                btn.innerHTML = '';
-                updateButtonColor();
-
-                // Create panel
-                panel = document.createElement('div');
-                Object.assign(panel.style, {
-                    position: 'fixed', width: '400px', maxHeight: '60vh', background: '#fff', 
-                    border: '1px solid #888', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', 
-                    fontSize: '12px', display: 'none', zIndex: 99999,
-                    overflow: 'hidden'
-                });
-
-                // Position panel near bottom-right with viewport-aware boundary checks
-                var positionErrorPanel = function() {
-                    if (!panel) {
-                        return;
-                    }
-                    // Desired offsets matching previous behavior
-                    var desiredBottom = 30; // px
-                    var desiredRight = 10;  // px
-
-                    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
-                    // Panel is constrained to 60% of viewport height
-                    var maxPanelHeight = vh * 0.6;
-
-                    // Ensure bottom offset plus max height does not exceed viewport
-                    if (desiredBottom + maxPanelHeight > vh) {
-                        desiredBottom = Math.max(10, vh - maxPanelHeight - 10);
-                    }
-
-                    panel.style.bottom = desiredBottom + 'px';
-                    panel.style.right = desiredRight + 'px';
-                };
-
-                // Initial positioning and keep responsive on resize
-                positionErrorPanel();
-                window.addEventListener('resize', positionErrorPanel);
-                const header = document.createElement('div');
-                Object.assign(header.style, {
-                    padding: '8px',
-                    borderBottom: '1px solid #ccc',
-                    background: '#f5f5f5'
-                });
-                header.innerHTML = `
-                    <button data-filter="all">All</button>
-                    <button data-filter="console">Console</button>
-                    <button data-filter="network">Network</button>
-                    <button id="err-clear" style="float:right">Clear</button>
-                    <hr style="margin-top: 8px; margin-bottom: 0;"/>
-                `;
-                panel.appendChild(header);
-
-                const list = document.createElement('ul');
-                Object.assign(list.style, { 
-                    padding: '8px', 
-                    paddingRight: '16px',
-                    listStyle: 'none',
-                    margin: '0',
-                    maxHeight: 'calc(60vh - 60px)',
-                    overflowY: 'auto',
-                    overflowX: 'hidden'
-                });
-                panel.appendChild(list);
-
-                btn.addEventListener('click', () => {
-                    panelOpen = !panelOpen;
-                    panel.style.display = panelOpen ? 'block' : 'none';
-                    if (panelOpen) {
-                        renderLogs(currentFilter);
-                    }
-                });
-
-                header.querySelectorAll('button[data-filter]').forEach((fb) => {
-                    fb.addEventListener('click', () => {
-                        currentFilter = fb.dataset.filter;
-                        renderLogs(currentFilter);
-                    });
-                });
-                header.querySelector('#err-clear').addEventListener('click', () => {
-                    logs.length = 0;
-                    updateButtonColor();
-                    renderLogs(currentFilter);
-                });
-
-                const injectUi = () => {
-                    const footerRight = document.getElementById('footer-right');
-                    if (!footerRight) return false;
-                    
-                    // Create wrapper span with same structure as other footer elements
-                    wrapper = document.createElement('span');
-                    const iconSpan = document.createElement('span');
-                    iconSpan.className = 'plugin-icon';
-                    iconSpan.appendChild(btn);
-                    
-                    const messageSpan = document.createElement('span');
-                    messageSpan.className = 'plugin-message';
-                    
-                    wrapper.appendChild(iconSpan);
-                    wrapper.appendChild(messageSpan);
-                    
-                    // Insert as first child in footer-right
-                    footerRight.insertBefore(wrapper, footerRight.firstChild);
-                    
-                    // Append panel to body
-                    document.body.appendChild(panel);
-                    
-                    // Watch for new elements being added to footer and keep error monitor at start
-                    footerObserver = new MutationObserver(() => {
-                        if (wrapper && wrapper.parentNode === footerRight) {
-                            // Only reposition if we're not already first
-                            if (footerRight.firstChild !== wrapper) {
-                                footerRight.insertBefore(wrapper, footerRight.firstChild);
-                            }
-                        }
-                    });
-                    footerObserver.observe(footerRight, { childList: true });
-                    
-                    return true;
-                };
-
-                if (!injectUi()) {
-                    uiObserver = new MutationObserver((mutations, obs) => {
-                        if (injectUi()) {
-                            obs.disconnect();
-                        }
-                    });
-                    uiObserver.observe(document.documentElement, { childList: true, subtree: true });
+                    document.addEventListener('DOMContentLoaded', domReadyHandler, { once: true });
+                    cleanupFns.push(() => document.removeEventListener('DOMContentLoaded', domReadyHandler));
+                } else {
+                    // DOM already ready
+                    setTimeout(() => initializeUI(), 100);
                 }
-            });
+            }
         }
 
         function stop() {
-            if (!started) return;
+            if (!started) {
+                debugLog('stop() called but not started');
+                return;
+            }
+            debugLog('Stopping feature and cleaning up');
             started = false;
+            interceptorsInstalled = false;
+            
+            // Clear any pending timeouts
+            if (debugFallbackTimeout) {
+                clearTimeout(debugFallbackTimeout);
+                debugFallbackTimeout = null;
+            }
+            
             while (cleanupFns.length) {
                 const fn = cleanupFns.pop();
-                try { fn(); } catch (e) { console.warn('[userscript] Error monitor cleanup failed', e); }
+                try { fn(); } catch (e) { console.warn('[ErrorMonitor] Cleanup failed', e); }
             }
+            debugLog('Feature stopped');
         }
 
         return { start, stop };
