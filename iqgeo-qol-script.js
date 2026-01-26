@@ -2902,7 +2902,7 @@
             cableTreeShowPatched = true;
         }
 
-        function setupMutationObserver() {
+        async function setupMutationObserver() {
             if (termMutationObserver) {
                 return;
             }
@@ -2912,7 +2912,17 @@
                 setupTreeListeners();
             });
     
-            termMutationObserver.observe(document.body, { childList: true, subtree: true });
+            // Wait for document.body to be available
+            try {
+                const targetNode = await waitFor(() => document.body, { timeoutMs: 10000, intervalMs: 100 });
+                termMutationObserver.observe(targetNode, { childList: true, subtree: true });
+            } catch (error) {
+                logger.warn(FEATURE_NAME, 'Timeout waiting for document.body, falling back to documentElement');
+                // Fallback to documentElement if body takes too long
+                if (document.documentElement) {
+                    termMutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+                }
+            }
         }
 
         function stopObserving() {
@@ -3696,29 +3706,30 @@
         return { start, stop };
     })();
 
+    // Shared utility: wait for a condition to be truthy
+    function waitFor(predicate, { timeoutMs = 30000, intervalMs = 500 } = {}) {
+        return new Promise((resolve, reject) => {
+            const start = Date.now();
+            const tick = () => {
+                try {
+                    const val = predicate();
+                    if (val) return resolve(val);
+                } catch {
+                    /* ignore */
+                }
+                if (Date.now() - start >= timeoutMs)
+                    return reject(new Error('waitFor: timeout'));
+                setTimeout(tick, intervalMs);
+            };
+            tick();
+        });
+    }
+
     // Plugin Overrides: displayManager, locManager
     const pluginOverridesFeature = (() => {
         'use strict';
 
         let started = false;
-
-        function waitFor(predicate, { timeoutMs = 30000, intervalMs = 500 } = {}) {
-            return new Promise((resolve, reject) => {
-                const start = Date.now();
-                const tick = () => {
-                    try {
-                        const val = predicate();
-                        if (val) return resolve(val);
-                    } catch {
-                        /* ignore */
-                    }
-                    if (Date.now() - start >= timeoutMs)
-                        return reject(new Error('waitFor: timeout'));
-                    setTimeout(tick, intervalMs);
-                };
-                tick();
-            });
-        }
 
         const getDisplayManager = () => {
             try {
