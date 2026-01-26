@@ -4269,11 +4269,9 @@
         return { start, stop };
     })();
 
-    // Panel Width Persistence: Save and restore left panel width across page reloads
+    // Panel Width Persistence: Patch DesktopLayout to remember west panel width
     const panelWidthPersistence = (() => {
         let started = false;
-        let resizeObserver = null;
-        let innerCenterObserver = null;
         let saveTimeout = null;
         const STORAGE_KEY = 'qol-west-pane-width';
         const SAVE_DELAY_MS = 500;
@@ -4290,135 +4288,61 @@
             return saved ? parseInt(saved, 10) : null;
         }
 
-        function restoreWidth() {
-            const westPane = document.querySelector('div#left-content');
-            const resizer = document.querySelector('.ui-layout-resizer-west');
-            const outerCenter = document.querySelector('#layout-map-view');
-            const innerCenter = document.querySelector('div#right-content');
-            const container = document.querySelector('.ui-layout-container');
-            const savedWidth = getSavedWidth();
-            
-            // Check if all required elements are present
-            if (!westPane || !resizer || !outerCenter || !innerCenter || !container || !savedWidth) {
+        function patchDesktopLayout() {
+            const DesktopLayout = window.myw?.DesktopLayout;
+            if (!DesktopLayout || !DesktopLayout.prototype) {
                 return false;
             }
             
-            try {
-                // Set west pane width
-                westPane.style.width = savedWidth + 'px';
-                
-                // Update resizer position
-                resizer.style.left = savedWidth + 'px';
-                
-                // Update outer center pane
-                const resizerWidth = resizer.offsetWidth || 3;
-                const centerLeft = savedWidth + resizerWidth;
-                outerCenter.style.left = centerLeft + 'px';
-                outerCenter.style.width = (container.offsetWidth - centerLeft) + 'px';
-                
-                // Remove width and setup guard for inner center
-                innerCenter.style.width = '';
-                setupInnerCenterWidthGuard(innerCenter);
-                
-                // Trigger resize
-                if (window.jQuery) {
-                    window.jQuery(window).trigger('resize');
-                }
-                
+            // Check if already patched
+            if (DesktopLayout.prototype.__westWidthPatched) {
                 return true;
-            } catch (e) {
-                console.error('[userscript] Panel width restore error:', e);
+            }
+            
+            // Patch the setBodyLayout method to inject saved width
+            const originalSetBodyLayout = DesktopLayout.prototype.setBodyLayout;
+            if (typeof originalSetBodyLayout !== 'function') {
                 return false;
-            }
         }
 
-        function attemptRestoreWithRetry() {
+            DesktopLayout.prototype.setBodyLayout = function(app) {
             const savedWidth = getSavedWidth();
-            if (!savedWidth) return;
-            
-            let attempts = 0;
-            const maxAttempts = 20; // Try for up to 10 seconds
-            const retryInterval = 500;
-            
-            const tryRestore = () => {
-                attempts++;
                 
-                // Try to restore
-                const success = restoreWidth();
-                
-                if (success) {
-                    // Verify it actually applied
-                    const westPane = document.querySelector('div#left-content');
-                    const actualWidth = westPane ? parseInt(westPane.style.width, 10) : 0;
-                    
-                    if (actualWidth === savedWidth) {
-                        // Success! Stop retrying
-                        return;
-                    }
-                }
-                
-                // Retry if we haven't hit max attempts
-                if (attempts < maxAttempts) {
-                    setTimeout(tryRestore, retryInterval);
-                }
-            };
-            
-            // Start trying after a short initial delay
-            setTimeout(tryRestore, 1000);
-        }
+                // Intercept the layout() call to wrap the west.onresize callback
+                const originalLayoutFn = this.$el.layout;
+                this.$el.layout = function(layoutOptions) {
+                    // Wrap the west pane's onresize callback to save width on resize
+                    if (layoutOptions && layoutOptions.west && layoutOptions.west.onresize) {
+                        const originalWestOnResize = layoutOptions.west.onresize;
+                        layoutOptions.west.onresize = function(paneName, paneElement, paneState, paneOptions, layoutName) {
+                            const result = originalWestOnResize.apply(this, arguments);
 
-        function setupInnerCenterWidthGuard(innerCenter) {
-            if (!innerCenter) return;
-            
-            if (innerCenterObserver) {
-                innerCenterObserver.disconnect();
-            }
-            
-            // Continuously remove width style if app tries to set it
-            innerCenterObserver = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    if (mutation.attributeName === 'style' && innerCenter.style.width) {
-                        innerCenter.style.width = '';
-                    }
-                });
-            });
-            
-            innerCenterObserver.observe(innerCenter, {
-                attributes: true,
-                attributeFilter: ['style']
-            });
-        }
-
-        function setupResizeMonitoring() {
-            const westPane = document.querySelector('div#left-content');
-            if (!westPane) return false;
-
-            // Monitor west pane for resize and save width
-            resizeObserver = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                    if (mutation.attributeName === 'style') {
-                        const currentWidth = westPane.style.width;
-                        if (currentWidth) {
+                            // Save the new width from paneState (debounced)
+                            if (started && paneState && typeof paneState.size === 'number' && paneState.size > 0) {
                             clearTimeout(saveTimeout);
-                            saveTimeout = setTimeout(() => {
-                                saveWidth(currentWidth);
-                            }, SAVE_DELAY_MS);
+                                saveTimeout = setTimeout(() => saveWidth(paneState.size), SAVE_DELAY_MS);
                         }
+                            
+                            return result;
+                        };
                     }
-                });
-            });
+                    
+                    return originalLayoutFn.call(this, layoutOptions);
+                };
 
-            resizeObserver.observe(westPane, {
-                attributes: true,
-                attributeFilter: ['style']
-            });
+                // Override westPanelInitialSize with saved width if available
+                if (savedWidth && this.options) {
+                    this.options.westPanelInitialSize = savedWidth;
+                }
+                
+                originalSetBodyLayout.call(this, app);
+                
+                // Restore original $el.layout
+                this.$el.layout = originalLayoutFn;
+            };
 
-            // Setup inner center width guard
-            const innerCenter = document.querySelector('div#right-content');
-            if (innerCenter) {
-                setupInnerCenterWidthGuard(innerCenter);
-            }
-
+            // Mark as patched
+            DesktopLayout.prototype.__westWidthPatched = true;
             return true;
         }
 
@@ -4426,28 +4350,13 @@
             if (started) return;
             started = true;
 
-            runWhenReady('div#left-content', () => {
-                // Use retry logic for reliable restoration
-                attemptRestoreWithRetry();
-                
-                // Setup monitoring
-                setupResizeMonitoring();
-            });
+            // Patch DesktopLayout prototype before it initializes
+            patchDesktopLayout();
         }
 
         function stop() {
             if (!started) return;
             started = false;
-
-            if (resizeObserver) {
-                resizeObserver.disconnect();
-                resizeObserver = null;
-            }
-
-            if (innerCenterObserver) {
-                innerCenterObserver.disconnect();
-                innerCenterObserver = null;
-            }
 
             if (saveTimeout) {
                 clearTimeout(saveTimeout);
