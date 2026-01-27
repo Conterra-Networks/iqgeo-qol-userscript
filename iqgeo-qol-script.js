@@ -14,7 +14,7 @@
         { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
         { label: "Restore Panel Width", description: "Remembers the left panel width across page reloads", defaultState: "on", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
-        { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "off", hidden: true },
+        { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "on", hidden: true },
         { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
     ];
     // Features not included:
@@ -4462,3 +4462,4 @@ splice group
     * determine why cable pairs are not grouped (inspect object map)
 
 */
+
