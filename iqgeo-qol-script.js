@@ -13,7 +13,7 @@
         { label: "Details Popup", description: "View the active Details content in a draggable popup", defaultState: "on", hidden: false },
         { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
         { label: "Restore Panel Width", description: "Remembers the left panel width across page reloads", defaultState: "on", hidden: false },
-        { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "on", hidden: false },
+        { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "off", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
         { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "on", hidden: true },
         { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
@@ -4646,3 +4646,4 @@ splice group
     * determine why cable pairs are not grouped (inspect object map)
 
 */
+
