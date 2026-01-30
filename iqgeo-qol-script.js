@@ -13,6 +13,7 @@
         { label: "Details Popup", description: "View the active Details content in a draggable popup", defaultState: "on", hidden: false },
         { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
         { label: "Restore Panel Width", description: "Remembers the left panel width across page reloads", defaultState: "on", hidden: false },
+        { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "on", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
         { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "on", hidden: true },
         { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
@@ -2959,35 +2960,56 @@
     })();
 
     var featureHorizontalMenu = (function() {
-        console.log("Running - Alt Add Object Menu")
+        // Configuration constants
+        const DIALOG_WIDTH_PERCENT = 0.75;  // Dialog width as percentage of viewport (75%)
+        const CUSTOMIZATION_DELAY_MS = 200; // Delay before customizing dialog to ensure DOM is ready
+        const COLUMN_MIN_WIDTH_PX = 120;     // Minimum width for each column
+        const COLUMN_GAP_PX = 15;            // Gap between columns
+        
+        let originalGetContents = null;
+        let originalShowDialog = null;
+        let patchApplied = false;
+        let styleElement = null;
+        let isStarted = false;
 
-        // CSS styles for the menu
-        var styles = `
-            .dialog-container {
-                width: 60% !important;
-                left: 50% !important;
-                transform: translate(-50%, 30%) !important;
+        // Base CSS - improves original dialog (always active, never removed)
+        var baseStyles = `
+            /* Original vertical dialog improvements */
+            .ui-dialog:has(.createFeature-dialog) {
+                top: 10% !important;
             }
-
+            
+            .createFeature-dialog {
+                max-height: 70vh !important;
+                overflow-y: auto !important;
+            }
+        `;
+        
+        // Feature CSS - horizontal menu specific (removed on stop)
+        var featureStyles = `
             .menu-container {
                 display: flex !important;
-                // overflow-y: scroll !important;
                 height: 500px !important;
-            }
-
-            .menu-container ul {
-                list-style-type: none !important;
+                gap: ${COLUMN_GAP_PX}px !important;
             }
 
             .menu-column {
-                flex: 1 !important;
-                // padding: 0px 5px !important;
-                // margin: 0px 5px !important;
+                flex: 0 1 auto !important;
+                min-width: ${COLUMN_MIN_WIDTH_PX}px !important;
+                padding-right: 10px !important;
+                border-right: 1px solid #ddd !important;
+            }
+
+            .menu-column:last-child {
+                border-right: none !important;
             }
 
             .menu-section {
                 font-weight: bold !important;
                 margin-bottom: 10px !important;
+                padding-bottom: 5px !important;
+                border-bottom: 1px solid #eee !important;
+                text-align: center !important;
             }
 
             .menu-items {
@@ -3000,113 +3022,276 @@
 
             .menu-container .menu-column .menu-items li {
                 padding: 0 !important;
-                margin: 0px 0px 5px 0px !important;
+                margin: 0px 0px 8px 0px !important;
+                line-height: 1.4 !important;
+                border-radius: 3px !important;
+            }
+
+            .menu-container .menu-column .menu-items li:hover {
+                background-color: #f5f5f5 !important;
+            }
+
+            /* Horizontal menu styling (when feature enabled and customized) */
+            .ui-dialog.qol-horizontal-menu {
+                position: fixed !important;
+                top: 50% !important;
+                left: 50% !important;
+                transform: translate(-50%, -50%) !important;
+                opacity: 1 !important;
+            }
+
+            .ui-dialog.qol-horizontal-menu .ui-dialog-titlebar {
+                cursor: default !important;
             }
         `;
+        
+        let baseStyleElement = null;
+        let featureStyleElement = null;
 
-        // Create a <style> element and insert the CSS styles
-        var styleElement = document.createElement('style');
-        styleElement.textContent = styles;
-        document.head.appendChild(styleElement);
+        // Inject base styles immediately (original dialog improvements always active)
+        (function injectBaseStyles() {
+            if (!baseStyleElement) {
+                baseStyleElement = document.createElement('style');
+                baseStyleElement.textContent = baseStyles;
+                document.head.appendChild(baseStyleElement);
+            }
+        })();
 
-        // Function to convert the menu into a horizontal layout
-        async function convertMenu() {
-            try {
-                // Find "Add Object" menu element
-                // var dialog
-                // var dialogs = document.querySelectorAll('[id*="ui-id-"]');
-                // if (dialogs) {
-                //     dialogs.forEach((e) => {
-                //         if (e.textContent === "Add Object") {
-                //             dialog = e;
-                //             return;
-                //         }
-                //     });
-                // } else {
-                //     throw new Error('Menu dialog not found');
-                // }
-
-                var dialog = document.querySelector('.createFeature-dialog');
-                if (!dialog) { 
-                    // Trigger opening menu for the first time to load contents
-                    // await myw?.app?.plugins?.createFeature?.showDialog();
-                    dialog = document.querySelector('.createFeature-dialog');
-                }
-                if (!dialog) return;
-                
-                var dialogParent = dialog.parentElement;
-                dialogParent.classList.add('dialog-container');
-
-                // Create the new menu container
-                var menuContainer = document.createElement('div');
-                menuContainer.classList.add('menu-container');
-                var fragment = document.createDocumentFragment();
-
-                var sections = dialog.querySelectorAll('.comms-feature-divider');
-                var sectionIndex = 0;
-
-                while (sectionIndex < sections.length) {
-                    var section = sections[sectionIndex];
-                    var column = document.createElement('div');
-                    column.classList.add('menu-column');
-
-                    var sectionTitle = section.querySelector('.comms-divider-label');
-                    var menuItems = [];
-
-                    var nextSibling = section.nextElementSibling;
-                    while (nextSibling && !nextSibling.classList.contains('comms-feature-divider')) {
-                        if (nextSibling.nodeName === 'LI') {
-                            menuItems.push(nextSibling.cloneNode(true));
-                        } else if (nextSibling.nodeName === 'UL') {
-                            var listItems = nextSibling.querySelectorAll('li');
-                            listItems.forEach(function(listItem) {
-                                menuItems.push(listItem.cloneNode(true));
-                            });
-                        }
-                        nextSibling = nextSibling.nextElementSibling;
-                    }
-
-                    if (sectionTitle) { // removed length check (menuItems.length > 0) to show blank sections
-                        var ul = document.createElement('ul');
-                        ul.classList.add('createFeature-menu', 'menu-items');
-
-                        menuItems.forEach(function (menuItem) {
-                            ul.appendChild(menuItem);
-                        });
-
-                        column.innerHTML = `
-                        <div class="menu-section">${sectionTitle.textContent}</div>
-                        ${ul.outerHTML}
-                    `;
-                        menuContainer.appendChild(column);
-                    }
-
-                    sectionIndex++;
-                }
-
-                fragment.appendChild(menuContainer);
-
-                // Only update the DOM once all elements are added to the document fragment
-                dialog.innerHTML = '';
-                dialog.appendChild(menuContainer);
-            } catch (error) {
-                console.error('Failed to convert menu:', error);
+        function injectStyles() {
+            // Inject feature styles (removed on stop)
+            if (!featureStyleElement) {
+                featureStyleElement = document.createElement('style');
+                featureStyleElement.textContent = featureStyles;
+                document.head.appendChild(featureStyleElement);
+            }
+        }
+        
+        function removeStyles() {
+            // Only remove feature-specific styles, keep base styles for original dialog
+            if (featureStyleElement && featureStyleElement.parentNode) {
+                featureStyleElement.parentNode.removeChild(featureStyleElement);
+                featureStyleElement = null;
             }
         }
 
-        return {
-            run: function() {
-                // Wait for the click event on the 'Add Object' menu element and convert the menu
-                // document.querySelector('#myWorldApp').addEventListener('click', function(event) {
-                //     if (event.target.matches('#a-createFeature')) {
-                //         convertMenu();
-                //     }
-                // });
-                runWhenReady("#a-createFeature", () => {
-                    document.querySelector('#a-createFeature').addEventListener('click', () => {
-                        convertMenu();
-                    });
+        // Function to transform jQuery content into horizontal layout
+        function transformContent(content) {
+            try {
+                // Clone to avoid mutating original
+                const $content = $(content).clone();
+                
+                // Create the new menu container
+                const menuContainer = $('<div>', { class: 'menu-container' });
+                
+                // Find all sections (dividers)
+                const sections = $content.find('.comms-feature-divider').toArray();
+                
+                sections.forEach((section) => {
+                    const $section = $(section);
+                    const column = $('<div>', { class: 'menu-column' });
+                    
+                    const sectionTitle = $section.find('.comms-divider-label').text();
+                    const menuItems = [];
+                    
+                    // Get all items until next divider
+                    let $next = $section.next();
+                    while ($next.length && !$next.hasClass('comms-feature-divider')) {
+                        if ($next.is('li')) {
+                            menuItems.push($next.clone());
+                        } else if ($next.is('ul')) {
+                            $next.find('li').each(function() {
+                                menuItems.push($(this).clone());
+                            });
+                        }
+                        $next = $next.next();
+                    }
+                    
+                    if (sectionTitle && menuItems.length > 0) {
+                        const ul = $('<ul>', { class: 'createFeature-menu menu-items' });
+                        menuItems.forEach(item => ul.append(item));
+                        
+                        column.append($('<div>', { class: 'menu-section', text: sectionTitle }));
+                        column.append(ul);
+                        menuContainer.append(column);
+                    }
                 });
+                
+                return menuContainer;
+            } catch (error) {
+                console.warn('[Alt Add Object Menu] Failed to transform content:', error);
+                return content; // Return original on error
+            }
+        }
+
+        function patchShowDialog() {
+            const createFeaturePlugin = window.myw?.app?.plugins?.createFeature;
+            if (!createFeaturePlugin || typeof createFeaturePlugin.showDialog !== 'function') {
+                console.log('[Alt Add Object Menu] showDialog not available');
+                return false;
+            }
+
+            // Store original method
+            originalShowDialog = createFeaturePlugin.showDialog.bind(createFeaturePlugin);
+
+            // Patch to resize and customize dialog after creation
+            createFeaturePlugin.showDialog = function(...args) {
+                // Reset dialog state BEFORE opening (for reused dialogs)
+                const existingDialog = $('.createFeature-dialog').parent('.ui-dialog');
+                if (existingDialog.length) {
+                    existingDialog.removeClass('qol-horizontal-menu');
+                    existingDialog.css('opacity', '0'); // Hide during customization
+                }
+                
+                const result = originalShowDialog.apply(this, args);
+                
+                setTimeout(() => {
+                    try {
+                        const dialog = $('.createFeature-dialog');
+                        const dialogWidget = dialog.parent('.ui-dialog');
+                        
+                        if (!dialogWidget.length) return; // Dialog not ready, skip customization
+                        
+                        // Hide during customization
+                        dialogWidget.css('opacity', '0');
+                        
+                        const viewportWidth = $(window).width();
+                        const newWidth = Math.floor(viewportWidth * DIALOG_WIDTH_PERCENT);
+                        
+                        // Add class for CSS positioning
+                        dialogWidget.addClass('qol-horizontal-menu');
+                        
+                        // Set width with !important via inline style
+                        const originalStyle = dialogWidget.attr('style') || '';
+                        const newStyle = originalStyle + '; width: ' + newWidth + 'px !important;';
+                        dialogWidget.attr('style', newStyle);
+                        
+                        // Show dialog
+                        dialogWidget.css('opacity', '1');
+                        
+                        // Override rePosition to maintain centering
+                        if (this.addObjectDialog) {
+                            this.addObjectDialog.rePosition = function() {
+                                return true; // CSS handles positioning
+                            };
+                        }
+                        
+                        // Disable dragging
+                        if (dialog.length && dialog.dialog) {
+                            try {
+                                dialog.dialog('option', 'draggable', false);
+                                dialogWidget.removeClass('ui-draggable'); // Remove class to fix cursor
+                            } catch (e) {
+                                console.error('[Alt Add Object Menu] Could not disable dragging:', e);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('[Alt Add Object Menu] Error customizing dialog:', e);
+                    }
+                }, CUSTOMIZATION_DELAY_MS);
+                
+                return result;
+            };
+
+            return true;
+        }
+
+        function unpatchShowDialog() {
+            if (!originalShowDialog) return;
+
+            const createFeaturePlugin = window.myw?.app?.plugins?.createFeature;
+            if (createFeaturePlugin) {
+                createFeaturePlugin.showDialog = originalShowDialog;
+            }
+
+            originalShowDialog = null;
+        }
+
+        function patchGetContents() {
+            const createFeaturePlugin = window.myw?.app?.plugins?.createFeature;
+            if (!createFeaturePlugin || typeof createFeaturePlugin.getContents !== 'function') {
+                console.log('[Alt Add Object Menu] createFeature plugin not ready');
+                return false;
+            }
+
+            if (patchApplied) {
+                return true;
+            }
+
+            // Store original method
+            originalGetContents = createFeaturePlugin.getContents.bind(createFeaturePlugin);
+
+            // Patch the method to transform content before returning
+            createFeaturePlugin.getContents = function(...args) {
+                return originalGetContents.apply(this, args).then(content => {
+                    
+                    // If content is a jQuery element with the menu class, transform it
+                    if (content && content.jquery && content.hasClass('createFeature-menu')) {
+                        return transformContent(content);
+                    }
+                    
+                    // Otherwise return as-is (for error messages, etc.)
+                    return content;
+                });
+            };
+
+            patchApplied = true;
+            return true;
+        }
+
+        function unpatchGetContents() {
+            if (!patchApplied || !originalGetContents) return;
+
+            const createFeaturePlugin = window.myw?.app?.plugins?.createFeature;
+            if (createFeaturePlugin) {
+                createFeaturePlugin.getContents = originalGetContents;
+            }
+
+            originalGetContents = null;
+            patchApplied = false;
+        }
+
+        function applyPatches() {
+            const createFeaturePlugin = window.myw?.app?.plugins?.createFeature;
+            if (!createFeaturePlugin) {
+                return false;
+            }
+
+            if (patchApplied) {
+                return true;
+            }
+            
+            const contentsPatched = patchGetContents();
+            const dialogPatched = patchShowDialog();
+            
+            if (contentsPatched && dialogPatched) {
+                patchApplied = true;
+                return true;
+            }
+            
+            return false;
+        }
+
+        function removePatches() {
+            unpatchGetContents();
+            unpatchShowDialog();
+        }
+
+        return {
+            start: function() {
+                if (isStarted) return; // Prevent multiple starts
+                isStarted = true;
+                injectStyles();
+                
+                runWhenReady("#a-createFeature", () => {
+                    if (!applyPatches()) {
+                        console.error('[Alt Add Object Menu] Failed to initialize');
+                    }
+                });
+            },
+            stop: function() {
+                removePatches();
+                removeStyles();
+                isStarted = false;
             }
         };
     })();
@@ -4413,6 +4598,7 @@
                 stop: () => { featureBetterTerminations.stopObserving(); disableXhrIntercept(); } 
             },
             "Restore Panel Width": { start: () => panelWidthPersistence.start(), stop: () => panelWidthPersistence.stop() },
+            "Custom Add Object": { start: () => featureHorizontalMenu.start(), stop: () => featureHorizontalMenu.stop() },
             "Error Monitor": { start: () => errorMonitorFeature.start(), stop: () => errorMonitorFeature.stop() },
             "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() }
         };
@@ -4420,8 +4606,6 @@
         featureManager.register(feature.label, handlers[feature.label] || {}, { defaultState: feature.defaultState });
     });
     featureManager.init();
-
-    featureHorizontalMenu.run();
 })();
 
 /*
@@ -4462,4 +4646,3 @@ splice group
     * determine why cable pairs are not grouped (inspect object map)
 
 */
-
