@@ -13,7 +13,7 @@
         { label: "Details Popup", description: "View the active Details content in a draggable popup", defaultState: "on", hidden: false },
         { label: "Auto Terminations", description: "Automatically displays fiber terminations (and more) for segments", defaultState: "on", hidden: false },
         { label: "Restore Panel Width", description: "Remembers the left panel width across page reloads", defaultState: "on", hidden: false },
-        { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "off", hidden: false },
+        { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "on", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
         { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "on", hidden: true },
         { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
@@ -74,16 +74,53 @@
     }
 
     const featureManager = (() => {
+        const STORAGE_KEY = "qol-features";
         const states = {};
         const features = {};
+        const defaults = {};
         let onChange = null;
+        let initialized = false;
 
-        function loadState(label, defaultState = "on") {
-            return localStorage.getItem(`qol-menu_${label}`) || defaultState;
+        // Load all states from unified localStorage object
+        function loadAllStates() {
+            try {
+                const stored = localStorage.getItem(STORAGE_KEY);
+                return stored ? JSON.parse(stored) : {};
+            } catch (e) {
+                console.error("[featureManager] Failed to load states from localStorage:", e);
+                return {};
+            }
         }
 
-        function persistState(label, state) {
-            localStorage.setItem(`qol-menu_${label}`, state);
+        // Save all states to unified localStorage object
+        function saveAllStates() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(states));
+            } catch (e) {
+                console.error("[featureManager] Failed to save states to localStorage:", e);
+            }
+        }
+
+        // Migrate old localStorage keys to new unified structure
+        function migrateOldKeys() {
+            let migrated = false;
+            Object.keys(defaults).forEach(label => {
+                const oldKey = `qol-menu_${label}`;
+                const oldValue = localStorage.getItem(oldKey);
+                if (oldValue) {
+                    // Only migrate if no new state exists
+                    if (!states[label]) {
+                        states[label] = oldValue;
+                        migrated = true;
+                        console.log(`[featureManager] Migrated ${oldKey} -> ${STORAGE_KEY}.${label}`);
+                    }
+                    // Always clean up old key
+                    localStorage.removeItem(oldKey);
+                }
+            });
+            if (migrated) {
+                saveAllStates();
+            }
         }
 
         function notify(label, state) {
@@ -93,27 +130,60 @@
         }
 
         function register(label, handlers = {}, options = {}) {
-            const { defaultState = "on" } = options;
+            const { defaultState = "on", hidden = false } = options;
+            
+            // Warn about duplicate registration
+            if (features[label]) {
+                console.warn(`[featureManager] Feature "${label}" already registered - overwriting`);
+            }
+            
+            // Store default and metadata
+            defaults[label] = defaultState;
+            
+            // Store handlers
             features[label] = {
                 start: handlers.start,
                 stop: handlers.stop,
+                hidden: hidden,
             };
-            if (!states[label]) {
-                states[label] = loadState(label, defaultState);
-            }
         }
 
         function setState(label, state) {
+            if (!features[label]) {
+                console.warn(`[featureManager] Attempted to set state for unregistered feature: ${label}`);
+                return;
+            }
+            
+            // Validate state parameter
+            if (state !== "on" && state !== "off") {
+                console.error(`[featureManager] State must be "on" or "off", got: ${state}`);
+                return;
+            }
+            
             if (states[label] === state) {
                 return;
             }
+            
+            const oldState = states[label];
             states[label] = state;
-            persistState(label, state);
-            if (state === "on") {
-                features[label]?.start?.();
-            } else {
-                features[label]?.stop?.();
+            saveAllStates();
+            
+            try {
+                if (state === "on") {
+                    features[label]?.start?.();
+                } else {
+                    features[label]?.stop?.();
+                }
+            } catch (e) {
+                console.error(`[featureManager] Error toggling feature "${label}":`, e);
+                // Rollback state on error
+                states[label] = oldState;
+                saveAllStates();
+                // Notify UI of rollback
+                notify(label, oldState);
+                return;
             }
+            
             notify(label, state);
         }
 
@@ -122,15 +192,92 @@
             setState(label, nextState);
         }
 
-        function init() {
-            Object.entries(features).forEach(([label, handlers]) => {
-                if (!states[label]) {
-                    states[label] = loadState(label, "on");
+        function validateConfiguration() {
+            const issues = [];
+            
+            Object.entries(features).forEach(([label, feature]) => {
+                const defaultState = defaults[label];
+                const isHidden = feature.hidden;
+                
+                // Check for hidden features defaulted to off
+                if (isHidden && defaultState === "off") {
+                    issues.push({
+                        severity: "warn",
+                        feature: label,
+                        message: "Hidden feature defaulted to 'off' - user cannot enable it"
+                    });
                 }
-                if (states[label] === "on") {
-                    handlers.start?.();
+                
+                // Check for missing handlers
+                if (!feature.start && !feature.stop) {
+                    issues.push({
+                        severity: "info",
+                        feature: label,
+                        message: "No start/stop handlers registered"
+                    });
                 }
             });
+            
+            return issues;
+        }
+
+        function init() {
+            if (initialized) {
+                console.warn("[featureManager] init() called multiple times - ignoring");
+                return;
+            }
+            initialized = true;
+            
+            // Load stored states
+            const storedStates = loadAllStates();
+            
+            // Migrate old localStorage format if needed
+            Object.assign(states, storedStates);
+            migrateOldKeys();
+            
+            // Initialize states for all registered features
+            Object.keys(features).forEach(label => {
+                if (states[label] === undefined) {
+                    states[label] = defaults[label] || "on";
+                }
+            });
+            
+            // Save initialized states
+            saveAllStates();
+            
+            // Validate configuration and log issues
+            const issues = validateConfiguration();
+            if (issues.length > 0) {
+                console.group("[featureManager] Configuration Issues");
+                issues.forEach(issue => {
+                    const logFn = issue.severity === "warn" ? console.warn : console.info;
+                    logFn(`[${issue.severity.toUpperCase()}] ${issue.feature}: ${issue.message}`);
+                });
+                console.groupEnd();
+            }
+            
+            // Log all feature states on startup
+            console.group("[featureManager] Feature States on Load");
+            Object.entries(features).forEach(([label, feature]) => {
+                const state = states[label];
+                const defaultState = defaults[label];
+                const hidden = feature.hidden ? " [HIDDEN]" : "";
+                console.log(`  ${label}${hidden}: ${state} (default: ${defaultState})`);
+            });
+            console.groupEnd();
+            
+            // Start enabled features
+            Object.entries(features).forEach(([label, handlers]) => {
+                if (states[label] === "on") {
+                    try {
+                        handlers.start?.();
+                    } catch (e) {
+                        console.error(`[featureManager] Error starting feature "${label}":`, e);
+                    }
+                }
+            });
+            
+            // Notify UI of initial states
             Object.entries(states).forEach(([label, state]) => notify(label, state));
         }
 
@@ -143,7 +290,20 @@
         }
 
         function getState(label) {
-            return states[label] || loadState(label, "on");
+            return states[label];
+        }
+
+        function getAllStates() {
+            return { ...states };
+        }
+
+        function getAllFeatures() {
+            return Object.keys(features).map(label => ({
+                label,
+                state: states[label],
+                defaultState: defaults[label],
+                hidden: features[label].hidden
+            }));
         }
 
         return {
@@ -154,8 +314,60 @@
             onStateChange,
             isEnabled,
             getState,
+            getAllStates,
+            getAllFeatures,
         };
     })();
+
+    // Expose feature controls to window after featureManager is defined
+    if (typeof window !== 'undefined') {
+        window.qolFeatures = {
+            // Get all feature names and their states
+            list: () => {
+                const features = featureManager.getAllFeatures();
+                console.table(features);
+                return features;
+            },
+            // Toggle a feature on/off
+            toggle: (label) => {
+                featureManager.toggle(label);
+                console.log(`[qolFeatures] Toggled "${label}" to: ${featureManager.getState(label)}`);
+            },
+            // Set a feature to specific state
+            set: (label, state) => {
+                if (state !== "on" && state !== "off") {
+                    console.error(`[qolFeatures] State must be "on" or "off", got: ${state}`);
+                    return;
+                }
+                featureManager.setState(label, state);
+                console.log(`[qolFeatures] Set "${label}" to: ${state}`);
+            },
+            // Get current state of a feature
+            get: (label) => {
+                return featureManager.getState(label);
+            },
+            // Check if a feature is enabled
+            isEnabled: (label) => {
+                return featureManager.isEnabled(label);
+            },
+            // Help text
+            help: () => {
+                console.log([
+                    "[qolFeatures] Available Commands:",
+                    "  qolFeatures.list()              - Show all features and their states",
+                    "  qolFeatures.toggle(\"Feature\")   - Toggle a feature on/off",
+                    "  qolFeatures.set(\"Feature\", \"on\") - Set feature to \"on\" or \"off\"",
+                    "  qolFeatures.get(\"Feature\")      - Get current state",
+                    "  qolFeatures.isEnabled(\"Feature\") - Check if feature is enabled",
+                    "  qolFeatures.help()              - Show this help",
+                    "",
+                    "Example:",
+                    "  qolFeatures.toggle(\"Error Monitor\")",
+                    "  qolFeatures.set(\"Plugin Patches\", \"off\")"
+                ].join("\n"));
+            }
+        };
+    }
 
     // credit: https://github.com/Tampermonkey/tampermonkey/issues/1279#issuecomment-875386821
     // Executes callback only after an element matching readySelector has been added to the page
@@ -850,8 +1062,6 @@
 
     // Feature - Details Popup
     var featureDetailsPopup = (function () {
-        console.log("Running - Details Popup")
-
         function addFeatureToGUI() {
             // Create the popup list item element
             var li = document.createElement("li");
@@ -1107,8 +1317,6 @@
 
     // Feature - Strand Splicing Calculator
     var featureStrandCalc = (function () {
-        console.log("Running - Splice Calc")
-
         // Track whether the overlay is open
         let overlayOpen = false;
         
@@ -1382,8 +1590,6 @@
 
     // Feature - Better Splice Details Layout
     var featureBetterSpliceDetails = (function () {
-        console.log('Running - Alt Splice Details');
-
         function addFeatureToGUI() {
             // Create button to run feature
             const div = document.createElement('div');
@@ -1756,7 +1962,6 @@
     // Feature - Auto Terminations (local storage caching, hover details appended to strand list)
     var featureBetterTerminations = (function() {
         const FEATURE_NAME = 'Terminations';
-        logger.info(FEATURE_NAME, "Running - Auto Terminations");
 
         const COMPANY_URL = `https://${window.location.hostname}`;
         const PORT = 'port';
@@ -3958,15 +4163,14 @@
             } catch (e) {
                 // If initial attempt fails, set up periodic retry
                 if (!addPinConnectionPatchRetryId) {
-                    console.info('[userscript] EquipTreeView not found for _addPinConnectionInfo patch, will retry periodically...');
                     addPinConnectionPatchRetryId = setInterval(() => {
                         const tv = getEquipTreeView();
                         if (tv && !tv.__addPinConnectionInfoPatched) {
                             clearInterval(addPinConnectionPatchRetryId);
                             addPinConnectionPatchRetryId = null;
-                            patchAddPinConnectionInfo(); // Retry the patch
+                            patchAddPinConnectionInfo();
                         }
-                    }, 5000); // Check every 5 seconds
+                    }, 5000);
                 }
                 return;
             }
@@ -4233,6 +4437,9 @@
         }
 
         let saveStatePatchRetryId = null;
+        let saveStateDebounceTimer = null;
+        const DEBUG_SAVESTATE = false; // Set to true for diagnostic logging
+        const SAVE_DEBOUNCE_MS = 500; // Wait 500ms after last change before writing to localStorage
 
         async function patchEquipmentTreeSaveState() {
             // Try with a reasonable initial timeout
@@ -4242,30 +4449,131 @@
             } catch (e) {
                 // If initial attempt fails, set up periodic retry
                 if (!saveStatePatchRetryId) {
-                    console.info('[userscript] EquipTreeView not found yet, will retry periodically...');
                     saveStatePatchRetryId = setInterval(() => {
                         const tv = getEquipTreeView();
                         if (tv && !tv.__saveStatePatched) {
                             clearInterval(saveStatePatchRetryId);
                             saveStatePatchRetryId = null;
-                            patchEquipmentTreeSaveState(); // Retry the patch
+                            patchEquipmentTreeSaveState();
                         }
-                    }, 5000); // Check every 5 seconds
+                    }, 5000);
                 }
                 return;
             }
 
             if (!treeView || treeView.__saveStatePatched) return;
 
-            // Seed incremental open-set from any prior saved state
+            // localStorage persistence constants
+            const STORAGE_KEY = 'qol-tree-state';
+            const MAX_STRUCTURES = 10; // Keep last 10 structures
+            const MAX_AGE_DAYS = 7; // Purge entries older than 7 days
+            
+            // Load and purge localStorage
+            function loadFromLocalStorage() {
+                try {
+                    const stored = localStorage.getItem(STORAGE_KEY);
+                    if (!stored) return {};
+                    
+                    const data = JSON.parse(stored);
+                    const now = Date.now();
+                    const maxAge = MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+                    
+                    // Purge old entries
+                    const purged = {};
+                    for (const [key, value] of Object.entries(data)) {
+                        if (now - value.timestamp < maxAge) {
+                            purged[key] = value;
+                        } else if (DEBUG_SAVESTATE) {
+                            console.log(`[userscript] Purged stale tree state for ${key}`);
+                        }
+                    }
+                    
+                    return purged;
+                } catch (e) {
+                    console.warn('[userscript] Error loading tree state from localStorage:', e);
+                    return {};
+                }
+            }
+            
+            // Save to localStorage with LRU purge
+            function saveToLocalStorage(structUrn, openNodes) {
+                try {
+                    const data = loadFromLocalStorage();
+                    
+                    if (openNodes.length === 0) {
+                        // Remove entry if only root is open (no state to save)
+                        if (data[structUrn]) {
+                            delete data[structUrn];
+                            localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+                            if (DEBUG_SAVESTATE) {
+                                console.log(`[userscript] Removed ${structUrn} - only root open`);
+                            }
+                        }
+                        return;
+                    }
+                    
+                    // Update entry
+                    data[structUrn] = {
+                        open: openNodes,
+                        timestamp: Date.now()
+                    };
+                    
+                    // LRU purge - keep only MAX_STRUCTURES most recent
+                    const entries = Object.entries(data);
+                    if (entries.length > MAX_STRUCTURES) {
+                        entries.sort((a, b) => b[1].timestamp - a[1].timestamp);
+                        const kept = Object.fromEntries(entries.slice(0, MAX_STRUCTURES));
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(kept));
+                        if (DEBUG_SAVESTATE) {
+                            console.log(`[userscript] Purged old entries, kept ${MAX_STRUCTURES} most recent`);
+                        }
+                    } else {
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+                    }
+                } catch (e) {
+                    console.warn('[userscript] Error saving tree state to localStorage:', e);
+                }
+            }
+            
+            // Wrapper - only write after 500ms of inactivity
+            function saveToLocalStorageWrapper(structUrn, openNodes) {
+                clearTimeout(saveStateDebounceTimer);
+                saveStateDebounceTimer = setTimeout(() => {
+                    saveToLocalStorage(structUrn, openNodes);
+                }, SAVE_DEBOUNCE_MS);
+            }
+
+            // Seed incremental open-set from localStorage and session state
             treeView.owner = treeView.owner || {};
             treeView.owner.saved_state = treeView.owner.saved_state || {};
-            const stateKey = treeView?.rootUrn;
-            const prior = (treeView.owner.saved_state[stateKey]?.open) || [];
+            
+            // Capture state key once for consistency
+            if (!treeView.rootUrn) {
+                console.warn('[userscript] treeView.rootUrn is not set, saveState may not work correctly');
+            }
+            
+            const stateKey = treeView.rootUrn;
+            
+            // Try localStorage first, fall back to session state
+            const localData = loadFromLocalStorage();
+            const localPrior = localData[stateKey]?.open || [];
+            const sessionPrior = (treeView.owner.saved_state[stateKey]?.open) || [];
+            const prior = localPrior.length > 0 ? localPrior : sessionPrior;
+            
             treeView._openSet = new Set(prior);
-
-            // Guard flag: pause saves during loading/restore bursts
-            treeView._suspendSaveState = false;
+            
+            // Include root in saved_state (not in _openSet/storage)
+            const openArray = Array.from(treeView._openSet);
+            const savedStateArray = [stateKey, ...openArray];
+            treeView.owner.saved_state[stateKey] = { open: savedStateArray };
+            
+            if (DEBUG_SAVESTATE && prior.length > 0) {
+                const source = localPrior.length > 0 ? 'localStorage' : 'session';
+                console.log(`[userscript] Initial: Restored ${prior.length} nodes from ${source}`);
+            }
+            
+            // Track current rootUrn for detecting structure changes
+            treeView._currentRootUrn = stateKey;
 
             // Lightweight check for "node or any parent is loading"
             function isNodeOrParentsLoading(inst, node) {
@@ -4284,59 +4592,114 @@
                 }
             }
 
-            // Replace saveState: O(1) add/remove; skip while loading
+            // Replace saveState: O(1) add/remove
             treeView.saveState = function (nodeData) {
-                if (!this.owner.saved_state || this._suspendSaveState) return;
+                if (!this.owner.saved_state) return;
                 if (!nodeData || !nodeData.instance) return;
 
                 const inst = nodeData.instance;
                 const node = inst.get_node(nodeData.node || nodeData);
                 if (!node) return;
 
-                if (isNodeOrParentsLoading(inst, node)) return;
+                // Skip if node or parents are still loading
+                if (isNodeOrParentsLoading(inst, node)) {
+                    if (DEBUG_SAVESTATE) {
+                        console.log('[userscript] Node or parent loading, skipping save:', node.id);
+                    }
+                    return;
+                }
+                
+                // Skip if DOM element doesn't exist (solution for race condition during slow loads)
+                const domEl = inst.get_node(node, true);
+                if (!domEl || !domEl.length) {
+                    if (DEBUG_SAVESTATE) {
+                        console.log('[userscript] DOM element missing, skipping save:', node.id);
+                    }
+                    return;
+                }
 
-                if (node.state && node.state.opened) {
+                const currentStateKey = this.rootUrn;
+                if (!currentStateKey) {
+                    console.warn('[userscript] rootUrn not available during saveState');
+                    return;
+                }
+
+                // Validate node ID is not empty/undefined
+                if (!node.id) {
+                    console.warn('[userscript] Invalid node.id during saveState:', node);
+                    return;
+                }
+
+                const wasOpen = this._openSet.has(node.id);
+                const isOpen = node.state && node.state.opened;
+
+                // Don't track root node in _openSet (it's always in saved_state)
+                if (node.id === this.rootUrn) return;
+                
+                if (isOpen) {
                     this._openSet.add(node.id);
+                    if (DEBUG_SAVESTATE && !wasOpen) {
+                        console.log('[userscript] Opened:', node.id);
+                    }
                 } else {
                     this._openSet.delete(node.id);
+                    if (DEBUG_SAVESTATE && wasOpen) {
+                        console.log('[userscript] Closed:', node.id);
+                    }
                 }
-                this.owner.saved_state[this.rootUrn] = { open: Array.from(this._openSet) };
+                
+                // Maintain consistency: root in saved_state, not in localStorage
+                const openArray = Array.from(this._openSet);
+                const savedStateArray = [currentStateKey, ...openArray];
+                this.owner.saved_state[currentStateKey] = { open: savedStateArray };
+                saveToLocalStorageWrapper(currentStateKey, openArray);
             };
 
-            // Bind guards when the container exists; re-bind on SPA remounts
-            function bindGuardsIfReady() {
-                try {
-                    const equipTreeContainer = treeView && treeView.container ? $(treeView.container) : null;
-                    if (!equipTreeContainer || !equipTreeContainer.length) return false;
-                    if (equipTreeContainer.data('__saveStateGuardBound')) return true;
-
-                    let resumeTimer;
-                    equipTreeContainer
-                        .off('.saveStateGuard')
-                        .on('loading.jstree.saveStateGuard', function () {
-                            treeView._suspendSaveState = true;
-                            clearTimeout(resumeTimer);
-                        })
-                        .on('load_node.jstree.saveStateGuard after_open.jstree.saveStateGuard', function () {
-                            clearTimeout(resumeTimer);
-                            resumeTimer = setTimeout(() => { treeView._suspendSaveState = false; }, 200);
-                        });
-
-                    equipTreeContainer.data('__saveStateGuardBound', true);
-                    console.info('[userscript] Bound saveState guards on equipmentTree container');
-                    return true;
-                } catch {
-                    return false;
+            // Patch getTreesFor to load saved state before tree initialization
+            // Runs after rootUrn is set but before tree is built
+            const originalGetTreesFor = treeView.getTreesFor;
+            treeView.getTreesFor = async function(feature, lazyBuild = false) {
+                // Get the root housing to determine rootUrn for this structure
+                const struct = await this.getRootHousing(feature);
+                const currentRootUrn = struct.getUrn();
+                
+                // If structure changed, load saved state before building tree
+                if (currentRootUrn && currentRootUrn !== this._currentRootUrn) {
+                    this._currentRootUrn = currentRootUrn;
+                    
+                    // Load open nodes from localStorage for this structure
+                    const localData = loadFromLocalStorage();
+                    const localPrior = localData[currentRootUrn]?.open || [];
+                    const sessionPrior = (this.owner.saved_state[currentRootUrn]?.open) || [];
+                    const prior = localPrior.length > 0 ? localPrior : sessionPrior;
+                    
+                    // Don't store root in _openSet, but include in saved_state
+                    this._openSet = new Set(prior.filter(id => id !== currentRootUrn));
+                    
+                    const openArray = Array.from(this._openSet);
+                    const savedStateArray = [currentRootUrn, ...openArray];
+                    this.owner.saved_state[currentRootUrn] = { open: savedStateArray };
+                    
+                    if (DEBUG_SAVESTATE) {
+                        console.log(`[userscript] Structure: ${currentRootUrn}`);
+                        console.log(`  Loaded ${prior.length} nodes from ${localPrior.length > 0 ? 'localStorage' : 'session'}`);
+                    }
                 }
-            }
-
-            // Try now, then poll lightly to catch future remounts
-            bindGuardsIfReady();
-            if (treeView.__saveStateGuardPollId) clearInterval(treeView.__saveStateGuardPollId);
-            treeView.__saveStateGuardPollId = setInterval(bindGuardsIfReady, 1000);
+                
+                // Now call original to build tree with our saved state
+                return await originalGetTreesFor.call(this, feature, lazyBuild);
+            };
 
             Object.defineProperty(treeView, '__saveStatePatched', { value: true });
-            console.info('[userscript] Patched equipmentTree.treeView.saveState');
+            
+            if (DEBUG_SAVESTATE) {
+                const currentStorage = loadFromLocalStorage();
+                const structCount = Object.keys(currentStorage).length;
+                console.info('[userscript] Tree state persistence enabled');
+                console.log(`  Currently tracking ${structCount}/${MAX_STRUCTURES} structures`);
+            } else {
+                console.info('[userscript] Patched equipmentTree.treeView with state persistence');
+            }
         }
 
         // async function armEquipmentTreeStateTrigger() {
@@ -4439,11 +4802,10 @@
                 addPinConnectionPatchRetryId = null;
             }
             
-            // Clean up tree view polling
-            const treeView = getEquipTreeView();
-            if (treeView && treeView.__saveStateGuardPollId) {
-                clearInterval(treeView.__saveStateGuardPollId);
-                treeView.__saveStateGuardPollId = null;
+            // Clear debounce timer
+            if (saveStateDebounceTimer) {
+                clearTimeout(saveStateDebounceTimer);
+                saveStateDebounceTimer = null;
             }
         }
 
@@ -4567,7 +4929,7 @@
     if (IS_LOGIN) {
         const autoLoginFeature = FEATURE_TOGGLES.find(f => f.label === "Auto Login");
         if (autoLoginFeature) {
-            featureManager.register(autoLoginFeature.label, { start: handleAutoLogin }, { defaultState: autoLoginFeature.defaultState });
+            featureManager.register(autoLoginFeature.label, { start: handleAutoLogin }, { defaultState: autoLoginFeature.defaultState, hidden: autoLoginFeature.hidden });
         }
         featureManager.init();
         return;
@@ -4603,7 +4965,7 @@
             "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() }
         };
         
-        featureManager.register(feature.label, handlers[feature.label] || {}, { defaultState: feature.defaultState });
+        featureManager.register(feature.label, handlers[feature.label] || {}, { defaultState: feature.defaultState, hidden: feature.hidden });
     });
     featureManager.init();
 })();
@@ -4646,4 +5008,3 @@ splice group
     * determine why cable pairs are not grouped (inspect object map)
 
 */
-
