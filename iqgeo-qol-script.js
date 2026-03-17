@@ -4154,6 +4154,7 @@
         };
 
         let addPinConnectionPatchRetryId = null;
+        let copyCoordinatePatchRetryId = null;
 
         async function patchAddPinConnectionInfo() {
             // Try with a reasonable initial timeout
@@ -4767,6 +4768,46 @@
             console.info('[userscript] Patched structureManager.structContent (delegating, no direct StructContents)');
         }
 
+        function patchCopyCoordinate() {
+            const map = window.myw?.app?.map;
+            if (!map || typeof map._copyCoordinate !== 'function') {
+                if (!copyCoordinatePatchRetryId) {
+                    copyCoordinatePatchRetryId = setInterval(() => {
+                        const m = window.myw?.app?.map;
+                        if (m && typeof m._copyCoordinate === 'function' && !m.__copyCoordinatePatched) {
+                            clearInterval(copyCoordinatePatchRetryId);
+                            copyCoordinatePatchRetryId = null;
+                            patchCopyCoordinate();
+                        }
+                    }, 5000);
+                }
+                return;
+            }
+
+            if (map.__copyCoordinatePatched) return;
+
+            map._copyCoordinate = function (mapArg, location) {
+                // location.coordinate is [lng, lat] - swap to [lat, lng]
+                const lat = location.coordinate[1].toFixed(7);
+                const lng = location.coordinate[0].toFixed(7);
+
+                const formatted = `${lat}, ${lng}`;
+
+                // Replacement for copyToClipboard() that is not available to patch
+                navigator.clipboard?.writeText(formatted).catch(() => {
+                    const el = document.createElement('textarea');
+                    el.value = formatted;
+                    document.body.appendChild(el);
+                    el.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(el);
+                });
+            };
+
+            Object.defineProperty(map, '__copyCoordinatePatched', { value: true });
+            console.info('[QOL] Plugin Patches: _copyCoordinate patched');
+        }
+
         async function applyPatches() {
             try { 
                 await Promise.all([
@@ -4776,6 +4817,7 @@
                     patchStructureManager(),
                     patchAddPinConnectionInfo()
                 ]);
+                patchCopyCoordinate();
             } catch (e) { 
                 console.error('[userscript] Patching error:', e); 
             }
@@ -4800,6 +4842,11 @@
             if (addPinConnectionPatchRetryId) {
                 clearInterval(addPinConnectionPatchRetryId);
                 addPinConnectionPatchRetryId = null;
+            }
+
+            if (copyCoordinatePatchRetryId) {
+                clearInterval(copyCoordinatePatchRetryId);
+                copyCoordinatePatchRetryId = null;
             }
             
             // Clear debounce timer
