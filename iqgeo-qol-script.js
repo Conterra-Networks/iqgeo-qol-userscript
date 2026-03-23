@@ -4813,7 +4813,7 @@
                 await Promise.all([
                     patchDisplayManager(), 
                     patchLocManager(), 
-                    patchEquipmentTreeSaveState(),
+                    // patchEquipmentTreeSaveState(),
                     patchStructureManager(),
                     patchAddPinConnectionInfo()
                 ]);
