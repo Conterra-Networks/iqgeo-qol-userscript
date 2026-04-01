@@ -6,6 +6,7 @@
     const IS_LOGIN = HREF.includes("/login");
     const IS_CONFIG = HREF.includes("/config");
     const IS_MYWCOM = HREF.includes("/mywcom");
+    const IS_APRIL_FOOLS = new Date().getMonth() === 3 && new Date().getDate() === 1; // April 1st (month is 0-indexed)
     const NOTIFICATION_POLL_MS = 300_000;
     const FEATURE_TOGGLES = [
         { label: "Auto Login", description: "Automatically uses OIDC login method", defaultState: "on", hidden: true },
@@ -16,7 +17,8 @@
         { label: "Custom Add Object", description: "Displays Add Object menu in a horizontal layout", defaultState: "on", hidden: false },
         { label: "Notifications", description: "Polls for and displays system notifications", defaultState: "on", hidden: true },
         { label: "Error Monitor", description: "Displays a console for errors and network issues", defaultState: "on", hidden: true },
-        { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true }
+        { label: "Plugin Patches", description: "Applies monkey-patches/overrides to IQGeo app internals", defaultState: "on", hidden: true },
+        { label: "Funny Day 🤪", description: "April Fools pranks", defaultState: "on", hidden: true } // Revealed in-menu only after all pranks have triggered
     ];
     // Features not included:
     // Splice Calc - Pending code removal
@@ -526,6 +528,53 @@
             gap: 6px;
             justify-content: flex-end;
             justify-self: end;
+        }
+
+        /* April Fools completion toast */
+        @keyframes qol-toast-in {
+            from { opacity: 0; transform: translateX(-50%) translateY(16px); }
+            to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        @keyframes qol-toast-out {
+            from { opacity: 1; transform: translateX(-50%) translateY(0); }
+            to   { opacity: 0; transform: translateX(-50%) translateY(16px); }
+        }
+        .qol-toast {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #f1f1f1;
+            border: 1px solid #999;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+            padding: 10px 18px 10px 18px;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #333;
+            z-index: 10001;
+            white-space: normal;
+            pointer-events: auto;
+            cursor: default;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            animation: qol-toast-in 0.35s ease forwards;
+        }
+        .qol-toast.qol-toast-dismissing {
+            animation: qol-toast-out 0.3s ease forwards;
+        }
+        .qol-toast-close {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 15px;
+            line-height: 1;
+            color: #888;
+            padding: 0;
+            flex-shrink: 0;
+        }
+        .qol-toast-close:hover {
+            color: #333;
         }
         `;
 
@@ -3516,88 +3565,716 @@
     // };
 
 
-    /*
+    // April Fools Feature
+    const aprilFoolsFeature = (() => {
 
-    // April Fools 2025
+        // Timing configuration - adjust here to tune behaviour. All times in minutes.
+        const TIMING = {
+            initialDelay:  { min: 2, max: 4  },  // Wait before first timed prank fires
+            prankCooldown: { min: 5, max: 10  },  // Gap between end of one prank and start of next
+        };
 
-    // Prank 1: Gradual Text Color Shift
-    function gradualTextColorShift() {
-        const targetElements = document.querySelectorAll('p, span, div'); // Adjust selectors as needed
-        const originalColors = new Map();
-
-        // Filter out elements that are not visible
-        const visibleElements = Array.from(targetElements).filter(el => {
-            return el.style.display !== 'none' && window.getComputedStyle(el).display !== 'none';
-        });
-
-        // Store original text colors
-        visibleElements.forEach(el => {
-            originalColors.set(el, el.style.color || window.getComputedStyle(el).color);
-        });
-
-        let hue = 0;
-        const intervalId = setInterval(() => {
-            hue = (hue + 1) % 360;
-            visibleElements.forEach(el => {
-                el.style.color = `hsl(${hue}, 50%, 50%)`;
-            });
-        }, 100); // Change color every 100ms
-
-        // Stop the color shift after 10 seconds and revert to original colors
-        setTimeout(() => {
-            clearInterval(intervalId);
-            visibleElements.forEach(el => {
-                el.style.color = originalColors.get(el);
-            });
-        }, 10000); // 10000ms = 10 seconds
-
-
-        // Repeat after 30 seconds if still enabled
-        if (isToggleButtonOn("Funny Day 🤪")) {
-            setTimeout(() => {
-                gradualTextColorShift();
-            }, 30000);
+        function randMinutes(min, max) {
+            return (min + Math.random() * (max - min)) * 60 * 1000;
         }
-    }
 
+        // Safety net: prevents mapTilt and upsideDownMap from overlapping if stop() is
+        // called mid-play (which bypasses the scheduler). The scheduler itself already
+        // ensures only one timed prank runs at a time.
+        let mapTransformActive = false;
 
-    // Prank 2: Delayed Image Swap
-    function delayedImageSwap() {
-        const swapDelay = 30000; // 30 seconds
-        const originalImages = [];
-        const funnyImages = [
-            'https://images.pexels.com/photos/6898857/pexels-photo-6898857.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1',
-            'https://images.pexels.com/photos/321552/pexels-photo-321552.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1',
-            'https://images.pexels.com/photos/2233442/pexels-photo-2233442.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1'
-        ];
+        // Discovery tracking:
+        // Tracks which pranks have been seen at least once. When every ID in
+        // ALL_PRANK_IDS has triggered, the 'Funny Day 🤪' toggle is dynamically
+        // added to the QOL menu so the user can disable pranks if desired.
+        const DISCOVERY_KEY = 'qol-pranks-discovered';
+        const NOTIFIED_KEY  = 'qol-pranks-notified';
+        const ALL_PRANK_IDS = ['textColorShift', 'imageSwap', 'mapTilt', 'upsideDownMap', 'shakingPanel', 'textResize', 'cursorFlip', 'rickRoll'];
 
-        document.querySelectorAll('img').forEach((img, index) => {
-            originalImages[index] = img.src;
-        });
+        function getDiscoveredPranks() {
+            try { return new Set(JSON.parse(localStorage.getItem(DISCOVERY_KEY) || '[]')); }
+            catch { return new Set(); }
+        }
 
-        setTimeout(() => {
-            document.querySelectorAll('img').forEach((img, index) => {
-                const randomIndex = Math.floor(Math.random() * funnyImages.length);
-                img.src = funnyImages[randomIndex];
+        function markDiscovered(id) {
+            const discovered = getDiscoveredPranks();
+            if (!discovered.has(id)) {
+                discovered.add(id);
+                try { localStorage.setItem(DISCOVERY_KEY, JSON.stringify([...discovered])); } catch {}
+            }
+            checkRevealToggle();
+        }
+
+        function checkRevealToggle() {
+            const discovered = getDiscoveredPranks();
+            if (ALL_PRANK_IDS.every(id => discovered.has(id))) {
+                runWhenReady('.floating-menu', revealToggle);
+            }
+        }
+
+        function showCompletionToast() {
+            const toast = document.createElement('div');
+            toast.className = 'qol-toast';
+
+            const msg = document.createElement('div');
+            const line1 = document.createElement('div');
+            line1.textContent = '🎉 You\'ve triggered all the pranks!';
+            const line2 = document.createElement('div');
+            line2.style.cssText = 'margin-top:3px;opacity:0.8;';
+            line2.textContent = 'The \'Funny Day 🤪\' toggle has been added to the QOL menu. Use it to disable pranks.';
+            msg.appendChild(line1);
+            msg.appendChild(line2);
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'qol-toast-close';
+            closeBtn.textContent = '×';
+            closeBtn.title = 'Dismiss';
+
+            toast.appendChild(msg);
+            toast.appendChild(closeBtn);
+            document.body.appendChild(toast);
+
+            function dismiss() {
+                localStorage.setItem(NOTIFIED_KEY, '1');
+                toast.classList.add('qol-toast-dismissing');
+                setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 320);
+            }
+
+            closeBtn.addEventListener('click', dismiss);
+
+            // Safety cleanup: auto-dismiss only after 2 minutes of continuous active
+            // presence (mouse/keyboard activity on a visible tab). Going idle or hiding
+            // the tab pauses the countdown; returning from either restarts it fresh.
+            // This ensures the user has genuinely had a chance to read the toast.
+            const SAFETY_MS = 2 * 60 * 1000;
+            const IDLE_MS = 30 * 1000; // consider user idle after 30s of no input
+            let safetyId = null;
+            let idleId = null;
+
+            function onIdle() {
+                clearTimeout(safetyId);
+                safetyId = null;
+            }
+
+            function onActivity() {
+                if (document.hidden) return;
+                clearTimeout(idleId);
+                // Restart safety countdown from the moment user returns from idle
+                if (!safetyId) safetyId = setTimeout(dismiss, SAFETY_MS);
+                idleId = setTimeout(onIdle, IDLE_MS);
+            }
+
+            function onVisibilityChange() {
+                if (document.hidden) {
+                    clearTimeout(safetyId);
+                    clearTimeout(idleId);
+                    safetyId = idleId = null;
+                }
+                // Visible: wait for first activity before starting countdown
+            }
+
+            document.addEventListener('visibilitychange', onVisibilityChange);
+            document.addEventListener('mousemove', onActivity);
+            document.addEventListener('keydown', onActivity);
+
+            function cleanup() {
+                clearTimeout(safetyId);
+                clearTimeout(idleId);
+                document.removeEventListener('visibilitychange', onVisibilityChange);
+                document.removeEventListener('mousemove', onActivity);
+                document.removeEventListener('keydown', onActivity);
+            }
+
+            closeBtn.addEventListener('click', cleanup, { once: true });
+        }
+
+        function revealToggle(menu) {
+            const inputId = 'toggle-funny-day-🤪';
+            if (document.getElementById(inputId)) return; // Already added
+            const feature = FEATURE_TOGGLES.find(f => f.label === 'Funny Day 🤪');
+            if (!feature) return;
+
+            const container = document.createElement('div');
+            container.classList.add('toggle-item');
+            const toggleSwitch = document.createElement('label');
+            toggleSwitch.classList.add('toggle-switch');
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.id = inputId;
+            input.checked = featureManager.isEnabled(feature.label);
+            const slider = document.createElement('span');
+            slider.classList.add('toggle-slider');
+            input.addEventListener('change', () => featureManager.toggle(feature.label));
+            toggleSwitch.appendChild(input);
+            toggleSwitch.appendChild(slider);
+            const label = document.createElement('label');
+            label.classList.add('toggle-label');
+            label.textContent = feature.label;
+            label.title = feature.description;
+            label.htmlFor = inputId;
+            container.appendChild(toggleSwitch);
+            container.appendChild(label);
+            menu.appendChild(container);
+            if (!localStorage.getItem(NOTIFIED_KEY)) {
+                showCompletionToast();
+            }
+        }
+
+        // Prank 1: Gradual Text Color Shift (2025)
+        // Cycles all visible text through a rainbow hue shift every 100ms for 10s,
+        // then reverts.
+        const textColorShift = (() => {
+            let intervalId = null;
+            let revertTimeoutId = null;
+            let originalColors = new Map();
+            const DURATION_MS = 10000;
+
+            return {
+                durationMs: DURATION_MS,
+                play() {
+                    markDiscovered('textColorShift');
+                    const visibleElements = Array.from(
+                        document.querySelectorAll('p, span, div')
+                    ).filter(el =>
+                        el.style.display !== 'none' &&
+                        window.getComputedStyle(el).display !== 'none' &&
+                        !el.closest('.gm-style')  // Exclude Google Maps elements - GM uses color property for internal positioning
+                    );
+
+                    // Store only the inline style value ('' if none set); restoring a computed
+                    // value as inline would incorrectly override CSS inheritance
+                    originalColors = new Map();
+                    visibleElements.forEach(el => originalColors.set(el, el.style.color));
+
+                    let hue = 0;
+                    intervalId = setInterval(() => {
+                        hue = (hue + 1) % 360;
+                        visibleElements.forEach(el => {
+                            el.style.color = `hsl(${hue}, 50%, 50%)`;
+                        });
+                    }, 100);
+
+                    revertTimeoutId = setTimeout(() => {
+                        clearInterval(intervalId);
+                        intervalId = null;
+                        visibleElements.forEach(el => { el.style.color = originalColors.get(el); });
+                    }, DURATION_MS);
+                },
+                stop() {
+                    clearInterval(intervalId);
+                    clearTimeout(revertTimeoutId);
+                    intervalId = revertTimeoutId = null;
+                    originalColors.forEach((color, el) => { el.style.color = color; });
+                    originalColors = new Map();
+                }
+            };
+        })();
+
+        // Prank 2: Image Swap (2025)
+        // Replaces all page images with random funny ones for 5s, then reverts.
+        const imageSwap = (() => {
+            const revertTimeoutIds = [];
+            const DISPLAY_MS = 5000; // How long funny images are shown before reverting
+            const funnyImages = [
+                'https://images.pexels.com/photos/6898857/pexels-photo-6898857.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1',
+                'https://images.pexels.com/photos/321552/pexels-photo-321552.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1',
+                'https://images.pexels.com/photos/2233442/pexels-photo-2233442.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1',
+                'https://gratisography.com/wp-content/uploads/2024/01/gratisography-cyber-kitty-1170x780.jpg',
+                'https://as2.ftcdn.net/jpg/14/52/54/13/1000_F_1452541395_yMpNpwGkHuBt8jdBLtIQvXCTCc708Nya.jpg',
+                'https://as1.ftcdn.net/jpg/16/02/76/80/1000_F_1602768095_DxbryJHB21uadh0d4vIVxZYz6CAmepg4.jpg'
+            ];
+
+            return {
+                durationMs: DISPLAY_MS,
+                play() {
+                    markDiscovered('imageSwap');
+                    document.querySelectorAll('img').forEach((img) => {
+                        const originalSrc = img.src;
+                        const originalWidth = img.style.width;
+                        const originalHeight = img.style.height;
+
+                        // Lock rendered dimensions before swap so layout doesn't reflow
+                        const rect = img.getBoundingClientRect();
+                        img.style.width = rect.width + 'px';
+                        img.style.height = rect.height + 'px';
+
+                        img.src = funnyImages[Math.floor(Math.random() * funnyImages.length)];
+
+                        const id = setTimeout(() => {
+                            img.src = originalSrc;
+                            img.style.width = originalWidth;
+                            img.style.height = originalHeight;
+                        }, DISPLAY_MS);
+                        revertTimeoutIds.push(id);
+                    });
+                },
+                stop() {
+                    revertTimeoutIds.forEach(id => clearTimeout(id));
+                    revertTimeoutIds.length = 0;
+                }
+            };
+        })();
+
+        // Prank 3: Map Tilt (2026)
+        // Gently tilts the map canvas a few degrees, then slowly corrects itself.
+        const mapTilt = (() => {
+            let revertTimeoutId = null;
+            let transitionCleanupTimeoutId = null;
+            const HOLD_MS = 5000;
+            const TRANSITION_MS = 1500;
+
+            return {
+                durationMs: HOLD_MS + TRANSITION_MS,
+                play() {
+                    const map = document.querySelector('#map_canvas');
+                    if (!map || mapTransformActive) return;
+                    mapTransformActive = true;
+                    markDiscovered('mapTilt');
+
+                    const originalTransition = map.style.transition;
+                    map.style.transition = `transform ${TRANSITION_MS}ms ease`;
+                    map.style.transform = 'rotate(4deg)';
+
+                    revertTimeoutId = setTimeout(() => {
+                        // Always revert to '' (mapTilt and upsideDownMap are the only
+                        // things that set this property, so '' is always the correct original)
+                        map.style.transform = '';
+                        transitionCleanupTimeoutId = setTimeout(() => {
+                            map.style.transition = originalTransition;
+                            mapTransformActive = false;
+                        }, TRANSITION_MS);
+                    }, HOLD_MS);
+                },
+                stop() {
+                    clearTimeout(revertTimeoutId);
+                    clearTimeout(transitionCleanupTimeoutId);
+                    revertTimeoutId = transitionCleanupTimeoutId = null;
+                    const map = document.querySelector('#map_canvas');
+                    if (map) { map.style.transition = ''; map.style.transform = ''; }
+                    mapTransformActive = false;
+                }
+            };
+        })();
+
+        // Prank 4: Shaking Details Panel (2026)
+        // Plays a brief shake animation on the Details panel each time a new feature
+        // loads. Event-driven, always active while the feature is enabled, bypasses
+        // the scheduler.
+        const shakingPanel = (() => {
+            let styleEl = null;
+            let observer = null;
+            let shakeTimeoutId = null;
+            let lastShakeTime = 0;
+            const COOLDOWN_MS = 5 * 60 * 1000; // Minimum gap between shakes (persists across stop/start)
+
+            const SHAKE_CSS = `
+                @keyframes qol-shake {
+                    0%, 100% { transform: translateX(0); }
+                    15%       { transform: translateX(-6px) rotate(-0.8deg); }
+                    30%       { transform: translateX(6px) rotate(0.8deg); }
+                    50%       { transform: translateX(-5px) rotate(-0.5deg); }
+                    70%       { transform: translateX(5px) rotate(0.5deg); }
+                    85%       { transform: translateX(-3px); }
+                }
+                .qol-shake {
+                    animation: qol-shake 0.5s ease;
+                }
+            `;
+
+            function shake() {
+                if (Date.now() - lastShakeTime < COOLDOWN_MS) return;
+                const panel = document.querySelector('#feature-details');
+                if (!panel) return;
+
+                lastShakeTime = Date.now();
+                markDiscovered('shakingPanel');
+                panel.classList.remove('qol-shake');
+                void panel.offsetWidth; // Force reflow to restart animation
+                panel.classList.add('qol-shake');
+                shakeTimeoutId = setTimeout(() => {
+                    panel.classList.remove('qol-shake');
+                }, 500); // class cleanup after animation ends
+            }
+
+            return {
+                start() {
+                    styleEl = document.createElement('style');
+                    styleEl.textContent = SHAKE_CSS;
+                    document.head.appendChild(styleEl);
+
+                    runWhenReady('#feature-details', (panel) => {
+                        observer = new MutationObserver(shake);
+                        observer.observe(panel, { childList: true, subtree: true });
+                    });
+                },
+                stop() {
+                    if (observer) { observer.disconnect(); observer = null; }
+                    clearTimeout(shakeTimeoutId);
+                    shakeTimeoutId = null;
+                    // lastShakeTime intentionally NOT reset; cooldown persists across stop/start
+                    if (styleEl && styleEl.parentNode) { styleEl.parentNode.removeChild(styleEl); styleEl = null; }
+                    const panel = document.querySelector('#feature-details');
+                    if (panel) panel.classList.remove('qol-shake');
+                }
+            };
+        })();
+
+        // Prank 5: Upside-Down Map (2026)
+        // Flips the map canvas 180 degrees for 5 seconds, then flips it back.
+        const upsideDownMap = (() => {
+            let revertTimeoutId = null;
+            let transitionCleanupTimeoutId = null;
+            const HOLD_MS = 5000;
+            const TRANSITION_MS = 800;
+
+            return {
+                durationMs: HOLD_MS + TRANSITION_MS,
+                play() {
+                    const map = document.querySelector('#map_canvas');
+                    if (!map || mapTransformActive) return;
+                    mapTransformActive = true;
+                    markDiscovered('upsideDownMap');
+
+                    const originalTransition = map.style.transition;
+                    map.style.transition = `transform ${TRANSITION_MS}ms ease`;
+                    map.style.transform = 'rotate(180deg)';
+
+                    revertTimeoutId = setTimeout(() => {
+                        // Always revert to '' (mapTilt and upsideDownMap are the only
+                        // things that set this property, so '' is always the correct original)
+                        map.style.transform = '';
+                        transitionCleanupTimeoutId = setTimeout(() => {
+                            map.style.transition = originalTransition;
+                            mapTransformActive = false;
+                        }, TRANSITION_MS);
+                    }, HOLD_MS);
+                },
+                stop() {
+                    clearTimeout(revertTimeoutId);
+                    clearTimeout(transitionCleanupTimeoutId);
+                    revertTimeoutId = transitionCleanupTimeoutId = null;
+                    const map = document.querySelector('#map_canvas');
+                    if (map) { map.style.transition = ''; map.style.transform = ''; }
+                    mapTransformActive = false;
+                }
+            };
+        })();
+
+        // Prank 6: Text Jumble (2026)
+        // Randomly scales text-heavy elements to comic proportions.
+        // Runs as an ambient pranklet on its own timer, independent of the scheduler.
+        const textResize = (() => {
+            let revertTimeoutId = null;
+            let nextPlayTimeoutId = null;
+            let affected = [];
+            const PLAY_DURATION_MS = 5000;
+            const AMBIENT_INTERVAL = { min: 8, max: 15 }; // minutes
+
+            function play() {
+                const candidates = Array.from(
+                    document.querySelectorAll('span, td, th, li')
+                ).filter(el =>
+                    el.childElementCount === 0 &&
+                    el.textContent.trim().length > 2 &&
+                    !el.closest('.gm-style') &&
+                    !el.closest('.floating-menu')
+                );
+                if (candidates.length === 0) return;
+                markDiscovered('textResize');
+
+                const count = Math.min(candidates.length, 15);
+                const chosen = candidates.sort(() => Math.random() - 0.5).slice(0, count);
+                affected = [];
+                chosen.forEach(el => {
+                    const originalTransform = el.style.transform;
+                    const originalDisplay = el.style.display;
+                    const scale = (0.3 + Math.random() * 2.2).toFixed(2);
+                    el.style.display = originalDisplay || 'inline-block';
+                    el.style.transform = `scale(${scale})`;
+                    el.style.transformOrigin = 'left center';
+                    affected.push({ el, originalTransform, originalDisplay });
+                });
+
+                clearTimeout(revertTimeoutId);
+                revertTimeoutId = setTimeout(() => {
+                    affected.forEach(({ el, originalTransform, originalDisplay }) => {
+                        el.style.transform = originalTransform;
+                        if (originalDisplay === '') el.style.removeProperty('display');
+                        else el.style.display = originalDisplay;
+                        el.style.removeProperty('transform-origin');
+                    });
+                    affected = [];
+                }, PLAY_DURATION_MS);
+            }
+
+            function scheduleAmbient() {
+                const delay = randMinutes(AMBIENT_INTERVAL.min, AMBIENT_INTERVAL.max);
+                nextPlayTimeoutId = setTimeout(() => {
+                    if (featureManager.isEnabled('Funny Day 🤪')) play();
+                    scheduleAmbient();
+                }, delay);
+            }
+
+            return {
+                durationMs: PLAY_DURATION_MS,
+                play,
+                startAmbient() { scheduleAmbient(); },
+                stop() {
+                    clearTimeout(revertTimeoutId);
+                    clearTimeout(nextPlayTimeoutId);
+                    revertTimeoutId = nextPlayTimeoutId = null;
+                    affected.forEach(({ el, originalTransform, originalDisplay }) => {
+                        el.style.transform = originalTransform;
+                        if (originalDisplay === '') el.style.removeProperty('display');
+                        else el.style.display = originalDisplay;
+                        el.style.removeProperty('transform-origin');
+                    });
+                    affected = [];
+                }
+            };
+        })();
+
+        // Prank 7: Upside-Down Cursor (2026)
+        // Replaces the cursor with an upside-down arrow pointer for a short while.
+        const cursorFlip = (() => {
+            let styleEl = null;
+            let revertTimeoutId = null;
+            const HOLD_MS = 10000;
+
+            // Standard pointer arrow shape, rotated 180° so the tip points down-right.
+            // Hotspot (20, 21) is near the bottom-right tip of the flipped arrow.
+            const SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path transform="rotate(180 12 12)" d="M4 3 L4 17 L7 14 L10 19.5 L12.5 18.5 L9.5 13 L14 13 Z" fill="white" stroke="black" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+            const cursorUrl = `data:image/svg+xml,${encodeURIComponent(SVG)}`;
+
+            return {
+                durationMs: HOLD_MS,
+                play() {
+                    markDiscovered('cursorFlip');
+                    styleEl = document.createElement('style');
+                    styleEl.textContent = `* { cursor: url("${cursorUrl}") 20 21, default !important; }`;
+                    document.head.appendChild(styleEl);
+                    revertTimeoutId = setTimeout(() => {
+                        if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
+                        styleEl = null;
+                    }, HOLD_MS);
+                },
+                stop() {
+                    clearTimeout(revertTimeoutId);
+                    revertTimeoutId = null;
+                    if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
+                    styleEl = null;
+                }
+            };
+        })();
+
+        // Prank 8: Rick Roll (2026)
+        // When the street view pane opens, overlays it with the classic video.
+        // Event-driven, always active while the feature is enabled, bypasses the scheduler.
+        const rickRoll = (() => {
+            let bodyObserver = null;
+            let paneObserver = null;
+            let currentIframe = null;
+            let currentToggleBtn = null;
+            let showingRickRoll = true;
+            const VOLUME = 15; // 0-100, low enough not to startle, still audible
+            // autoplay=0: start paused so volume is set before playback begins.
+            // enablejsapi=1: allows postMessage commands (setVolume, playVideo).
+            const VIDEO_URL = 'https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=0&enablejsapi=1';
+
+            function setVolumeAndPlay(iframe) {
+                // YouTube IFrame API accepts postMessage commands when enablejsapi=1.
+                // We wait a moment after load to ensure the player is initialised,
+                // then set the volume before triggering playback so there is no loud burst.
                 setTimeout(() => {
-                    img.src = originalImages[index];
-                }, 10000); // Revert after 10 seconds
-            });
-        }, swapDelay);
+                    iframe.contentWindow?.postMessage(
+                        JSON.stringify({ event: 'command', func: 'setVolume', args: [VOLUME] }),
+                        'https://www.youtube.com'
+                    );
+                    iframe.contentWindow?.postMessage(
+                        JSON.stringify({ event: 'command', func: 'playVideo', args: [] }),
+                        'https://www.youtube.com'
+                    );
+                }, 800);
+            }
+
+            function isPaneVisible(pane) {
+                return pane.style.display !== 'none' && window.getComputedStyle(pane).display !== 'none';
+            }
+
+            function removeOverlay() {
+                if (currentIframe && currentIframe.parentNode) currentIframe.parentNode.removeChild(currentIframe);
+                currentIframe = null;
+            }
+
+            // The toggle button lives in the panel header above the pane (feature-plugins-header),
+            // matching the style of the existing expand/collapse icon already present there.
+            function syncToggleBtn(pane) {
+                if (currentToggleBtn && currentToggleBtn.parentNode) currentToggleBtn.parentNode.removeChild(currentToggleBtn);
+                const header = pane.parentElement?.querySelector('.feature-plugins-header');
+                if (!header) return;
+
+                const btn = document.createElement('button');
+                btn.className = 'qol-rick-toggle';
+                // margin-left:auto pushes the button to the far right when the header is a flex row.
+                // The button is appended last so the title text stays on the left.
+                btn.style.cssText = 'background:none;border:none;cursor:pointer;padding:0 4px;font-size:11px;vertical-align:middle;margin-left:auto;opacity:0.7;';
+                if (showingRickRoll) {
+                    btn.title = 'Switch to real Street View';
+                    btn.textContent = '↩ Street View';
+                    btn.addEventListener('click', (e) => { e.stopPropagation(); showingRickRoll = false; removeOverlay(); syncToggleBtn(pane); });
+                } else {
+                    btn.title = 'Switch to Rick Roll';
+                    btn.textContent = '🎵 Rick Roll';
+                    btn.addEventListener('click', (e) => { e.stopPropagation(); showingRickRoll = true; injectOverlay(pane); syncToggleBtn(pane); });
+                }
+                header.appendChild(btn);
+                currentToggleBtn = btn;
+            }
+
+            function injectOverlay(pane) {
+                if (pane.querySelector('.qol-rick-roll')) return;
+                markDiscovered('rickRoll');
+                const iframe = document.createElement('iframe');
+                iframe.className = 'qol-rick-roll';
+                iframe.src = VIDEO_URL;
+                iframe.style.cssText = 'width:100%;height:100%;border:0;position:absolute;top:0;left:0;z-index:999;';
+                iframe.allow = 'autoplay; encrypted-media';
+                iframe.allowFullscreen = true;
+                iframe.addEventListener('load', () => setVolumeAndPlay(iframe), { once: true });
+                pane.appendChild(iframe);
+                currentIframe = iframe;
+            }
+
+            function attachPaneObserver(pane) {
+                if (paneObserver) { paneObserver.disconnect(); }
+                paneObserver = new MutationObserver(() => {
+                    if (!isPaneVisible(pane)) {
+                        // Pane hidden - stop video to avoid background network traffic
+                        removeOverlay();
+                    } else if (showingRickRoll && !pane.querySelector('.qol-rick-roll')) {
+                        // Pane made visible again - restore video
+                        injectOverlay(pane);
+                    }
+                });
+                paneObserver.observe(pane, { attributes: true, attributeFilter: ['style', 'class'] });
+            }
+
+            function checkPane() {
+                const pane = document.querySelector('div.street-view-small');
+                if (!pane || !isPaneVisible(pane) || !pane.children.length) return;
+                // Fresh pane with no overlay state - set up from scratch
+                if (!pane.parentElement?.querySelector('.qol-rick-toggle')) {
+                    showingRickRoll = true;
+                    pane.style.position = 'relative';
+                    attachPaneObserver(pane);
+                    injectOverlay(pane);
+                    syncToggleBtn(pane);
+                }
+            }
+
+            return {
+                play() { checkPane(); },
+                start() {
+                    bodyObserver = new MutationObserver(checkPane);
+                    bodyObserver.observe(document.body, { childList: true, subtree: true });
+                    checkPane();
+                },
+                stop() {
+                    if (bodyObserver) { bodyObserver.disconnect(); bodyObserver = null; }
+                    if (paneObserver) { paneObserver.disconnect(); paneObserver = null; }
+                    removeOverlay();
+                    if (currentToggleBtn && currentToggleBtn.parentNode) currentToggleBtn.parentNode.removeChild(currentToggleBtn);
+                    currentToggleBtn = null;
+                }
+            };
+        })();
+
+        // Each timed prank needs: durationMs (how long its effect runs), play(), stop()
+        // Add to this array to register with the central scheduler.
+        const timedPranks = [textColorShift, imageSwap, mapTilt, upsideDownMap, cursorFlip];
+
+        // Central scheduler:
+        // Picks one timed prank at random, plays it, waits for it to fully complete,
+        // then waits a cooldown before picking the next. Only one prank runs at a time.
+        let schedulerTimeoutId = null;
+        let activePrank = null;
+
+        function scheduleNext() {
+            if (!featureManager.isEnabled('Funny Day 🤪')) return;
+            const cooldown = randMinutes(TIMING.prankCooldown.min, TIMING.prankCooldown.max);
+            schedulerTimeoutId = setTimeout(() => {
+                // Avoid repeating the same prank back-to-back if possible
+                const pool = timedPranks.filter(p => p !== activePrank);
+                activePrank = pool[Math.floor(Math.random() * pool.length)];
+                activePrank.play();
+                schedulerTimeoutId = setTimeout(scheduleNext, activePrank.durationMs);
+            }, cooldown);
+        }
+
+        // Registry used by the debug API (window.qolPranks)
+        const allPranks = { textColorShift, imageSwap, mapTilt, upsideDownMap, shakingPanel, textResize, cursorFlip, rickRoll };
+
+        return {
+            // Manually fire a prank by name (for testing via the console)
+            trigger(name) {
+                const prank = allPranks[name];
+                if (!prank) {
+                    console.warn(`[April Fools] Unknown prank: "${name}". Valid names:`, Object.keys(allPranks).join(', '));
+                    return;
+                }
+                prank.play ? prank.play() : prank.start?.();
+            },
+            list() {
+                console.log('[April Fools] Available pranks:', Object.keys(allPranks).join(', '));
+                return Object.keys(allPranks);
+            },
+            start() {
+                if (!IS_APRIL_FOOLS) return;
+                runWhenReady('#map_canvas', () => {
+                    // Event-driven pranks start immediately (no scheduling needed)
+                    shakingPanel.start();
+                    rickRoll.start();
+                    textResize.startAmbient();
+
+                    // Reveal toggle immediately if all pranks were seen in a prior session
+                    checkRevealToggle();
+
+                    // Wait initial delay before the first timed prank fires
+                    const initialDelay = randMinutes(TIMING.initialDelay.min, TIMING.initialDelay.max);
+                    schedulerTimeoutId = setTimeout(() => {
+                        activePrank = timedPranks[Math.floor(Math.random() * timedPranks.length)];
+                        activePrank.play();
+                        schedulerTimeoutId = setTimeout(scheduleNext, activePrank.durationMs);
+                    }, initialDelay);
+                });
+            },
+            stop() {
+                clearTimeout(schedulerTimeoutId);
+                schedulerTimeoutId = null;
+                activePrank = null;
+                timedPranks.forEach(p => p.stop());
+                shakingPanel.stop();
+                rickRoll.stop();
+                textResize.stop();
+            }
+        };
+    })();
+
+    // Expose prank controls to the console for testing
+    if (typeof window !== 'undefined') {
+        window.qolPranks = {
+            trigger: (name) => aprilFoolsFeature.trigger(name),
+            list: () => aprilFoolsFeature.list(),
+            help: () => console.log([
+                '[qolPranks] Available commands:',
+                '  qolPranks.list()           - List all prank names',
+                '  qolPranks.trigger("name")  - Manually fire a prank',
+                '',
+                'Example:  qolPranks.trigger("rickRoll")',
+            ].join('\n'))
+        };
     }
 
-    // Initialize April Fools' "pranks" if enabled in QOL menu
-    runWhenReady("#map_canvas", () => {
-        if (isToggleButtonOn("Funny Day 🤪")) {
-            gradualTextColorShift();
-            // delayedImageSwap();
-        }
-    });
-    */
-
-
-
-    
     // Error Monitor
     const errorMonitorFeature = (() => {
         let started = false;
@@ -5009,7 +5686,8 @@
             "Restore Panel Width": { start: () => panelWidthPersistence.start(), stop: () => panelWidthPersistence.stop() },
             "Custom Add Object": { start: () => featureHorizontalMenu.start(), stop: () => featureHorizontalMenu.stop() },
             "Error Monitor": { start: () => errorMonitorFeature.start(), stop: () => errorMonitorFeature.stop() },
-            "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() }
+            "Plugin Patches": { start: () => pluginOverridesFeature.start(), stop: () => pluginOverridesFeature.stop() },
+            "Funny Day 🤪": { start: () => aprilFoolsFeature.start(), stop: () => aprilFoolsFeature.stop() }
         };
         
         featureManager.register(feature.label, handlers[feature.label] || {}, { defaultState: feature.defaultState, hidden: feature.hidden });
