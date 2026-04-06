@@ -75,6 +75,97 @@
         window.qolDebug = DEBUG_CONFIG;
     }
 
+    // ─── Hover Highlight Color Preferences ───────────────────────────────────────
+    const HIGHLIGHT_COLORS_KEY = 'qol-highlight-colors';
+    const HIGHLIGHT_COLORS_DEFAULTS = {
+        color1: { enabled: false, value: '#FF0000', weight: 4, opacity: 0.75 },
+        color2: { enabled: false, value: '#0000FF', weight: 4, opacity: 0.75 }
+    };
+
+    let _highlightColorsCache = null;
+
+    function loadHighlightColors() {
+        if (_highlightColorsCache) return _highlightColorsCache;
+        try {
+            const stored = localStorage.getItem(HIGHLIGHT_COLORS_KEY);
+            if (!stored) {
+                _highlightColorsCache = {
+                    color1: { ...HIGHLIGHT_COLORS_DEFAULTS.color1 },
+                    color2: { ...HIGHLIGHT_COLORS_DEFAULTS.color2 }
+                };
+            } else {
+                const parsed = JSON.parse(stored);
+                _highlightColorsCache = {
+                    color1: { ...HIGHLIGHT_COLORS_DEFAULTS.color1, ...parsed.color1 },
+                    color2: { ...HIGHLIGHT_COLORS_DEFAULTS.color2, ...parsed.color2 }
+                };
+            }
+        } catch (e) {
+            _highlightColorsCache = {
+                color1: { ...HIGHLIGHT_COLORS_DEFAULTS.color1 },
+                color2: { ...HIGHLIGHT_COLORS_DEFAULTS.color2 }
+            };
+        }
+        return _highlightColorsCache;
+    }
+
+    function saveHighlightColors(colors) {
+        try {
+            localStorage.setItem(HIGHLIGHT_COLORS_KEY, JSON.stringify(colors));
+            _highlightColorsCache = null; // invalidate cache after save
+        } catch (e) {
+            console.error('[userscript] Failed to save highlight colors:', e);
+        }
+    }
+
+    // Debounced tree refresh - called after any highlight pref change so the
+    // new colors bake in without the user having to navigate away and back.
+    let _refreshEquipTreeTimer = null;
+    function refreshEquipmentTree() {
+        clearTimeout(_refreshEquipTreeTimer);
+        _refreshEquipTreeTimer = setTimeout(() => {
+            try {
+                const ev = window.myw?.app?.plugins?.equipmentTree?.treeView;
+                if (ev?.feature) ev.refreshFor(ev.feature).catch(() => {});
+                const ct = window.myw?.app?.plugins?.cableTree;
+                if (ct) {
+                    ['structCableTreeView', 'routeTreeView'].forEach(key => {
+                        const ctv = ct[key];
+                        if (ctv?.feature) ctv.refreshFor(ctv.feature).catch(() => {});
+                    });
+                }
+            } catch (e) {
+                // silently ignore if trees not available
+            }
+        }, 150);
+    }
+
+    // Apply geomRepFor highlight color override to any PinFeatureTreeView instance.
+    // Shared helper used for both equipmentTree.treeView and cableTree views.
+    function applyGeomRepForPatch(treeView) {
+        if (!treeView || treeView.__geomRepForPatched) return;
+        const origGeomRepFor = treeView.geomRepFor.bind(treeView);
+        treeView.geomRepFor = function (feature, geom, id, color, style) {
+            const rep = origGeomRepFor(feature, geom, id, color, style);
+            const prefs = loadHighlightColors();
+            const role = color == null ? 'color1' : 'color2';
+            const pref = prefs[role];
+            if (pref.enabled) {
+                rep.color = pref.value;
+                if (rep.style) {
+                    rep.style.color = pref.value;
+                    rep.style.weight = pref.weight;
+                    rep.style.opacity = pref.opacity;
+                }
+            }
+            return rep;
+        };
+        Object.defineProperty(treeView, '__geomRepForPatched', { value: true });
+        // If the tree was already built before this patch fired, force a rebuild.
+        if (treeView.feature) refreshEquipmentTree();
+    }
+    // ─────────────────────────────────────────────────────────────────────────────
+
     const featureManager = (() => {
         const STORAGE_KEY = "qol-features";
         const states = {};
@@ -413,6 +504,7 @@
             position: fixed;
             top: 52px;
             right: 160px;
+            width: 190px;
             background-color: #f1f1f1;
             border: 1px solid #999;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
@@ -576,6 +668,107 @@
         .qol-toast-close:hover {
             color: #333;
         }
+
+        /* Hover highlight color picker section */
+        .qol-color-section {
+            border-top: 1px solid #ccc;
+            margin-top: 8px;
+            padding-top: 8px;
+        }
+        .qol-color-heading {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 6px;
+        }
+        .qol-color-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 4px;
+        }
+        .qol-color-enable {
+            flex-shrink: 0;
+            cursor: pointer;
+        }
+        .qol-color-label {
+            font-size: 13px;
+            color: #333;
+            cursor: pointer;
+            user-select: none;
+            flex: 1;
+        }
+        .qol-color-swatch {
+            width: 28px;
+            height: 20px;
+            padding: 1px 2px;
+            border: 1px solid #999;
+            border-radius: 3px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .qol-color-swatch:disabled {
+            opacity: 0.35;
+            cursor: default;
+        }
+        .qol-color-gear {
+            background: none;
+            border: none;
+            padding: 0 2px;
+            font-size: 13px;
+            color: #111;
+            cursor: pointer;
+            line-height: 1;
+            flex-shrink: 0;
+            transition: color 0.15s, transform 0.2s;
+        }
+        .qol-color-gear:hover {
+            color: #444;
+        }
+        .qol-color-gear.open {
+            color: #3ca22d;
+            transform: rotate(45deg);
+        }
+        .qol-color-detail {
+            display: none;
+            flex-direction: column;
+            gap: 4px;
+            padding: 2px 0 6px 20px;
+        }
+        .qol-color-detail.open {
+            display: flex;
+        }
+        .qol-color-slider-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .qol-color-detail-label {
+            font-size: 11px;
+            color: #888;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .qol-color-slider {
+            width: 70px;
+            min-width: 0;
+            flex-shrink: 1;
+            cursor: pointer;
+            accent-color: #3ca22d;
+        }
+        .qol-color-slider:disabled {
+            opacity: 0.4;
+            cursor: default;
+        }
+        .qol-color-slider-val {
+            font-size: 11px;
+            color: #555;
+            white-space: nowrap;
+            width: 28px;
+            text-align: right;
+            flex-shrink: 0;
+        }
         `;
 
         // Append the style element to the document head
@@ -591,10 +784,18 @@
         button.title = "Toggle Quality of Life Features";
 
         // Add event listener to toggle menu visibility
-        button.addEventListener("click", function () {
+        button.addEventListener("click", function (e) {
+            e.stopPropagation();
             if (menu.style.display === "none") {
                 menu.style.display = "block";
             } else {
+                menu.style.display = "none";
+            }
+        });
+
+        // Close menu when clicking anywhere outside it
+        document.addEventListener("click", function (e) {
+            if (menu.style.display !== "none" && !menu.contains(e.target)) {
                 menu.style.display = "none";
             }
         });
@@ -607,6 +808,175 @@
         FEATURE_TOGGLES.filter(f => !f.hidden).forEach((feature) => {
             menu.appendChild(createToggleButton(feature));
         });
+
+        // Hover highlight color pickers
+        (function () {
+            const section = document.createElement('div');
+            section.classList.add('qol-color-section');
+
+            const heading = document.createElement('div');
+            heading.classList.add('qol-color-heading');
+            heading.textContent = 'Hover highlight colors';
+            section.appendChild(heading);
+
+            const colorDefs = [
+                { key: 'color1', label: 'Primary', id: 'qol-hl-1' },
+                { key: 'color2', label: 'Secondary', id: 'qol-hl-2' }
+            ];
+
+            const colors = loadHighlightColors();
+            colorDefs.forEach(function (def) {
+                // Main row: checkbox – label – color swatch – gear
+                const row = document.createElement('div');
+                row.classList.add('qol-color-row');
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.id = def.id + '-enable';
+                checkbox.classList.add('qol-color-enable');
+                checkbox.checked = colors[def.key].enabled;
+                checkbox.title = 'Enable custom highlight color';
+
+                const lbl = document.createElement('label');
+                lbl.classList.add('qol-color-label');
+                lbl.htmlFor = def.id + '-color';
+                lbl.textContent = def.label;
+
+                const picker = document.createElement('input');
+                picker.type = 'color';
+                picker.id = def.id + '-color';
+                picker.classList.add('qol-color-swatch');
+                picker.value = colors[def.key].value;
+                picker.disabled = !colors[def.key].enabled;
+                picker.title = def.label + ' highlight color';
+
+                const gearBtn = document.createElement('button');
+                gearBtn.type = 'button';
+                gearBtn.classList.add('qol-color-gear');
+                gearBtn.textContent = '⚙';
+                gearBtn.title = 'Width & Opacity';
+
+                row.appendChild(checkbox);
+                row.appendChild(lbl);
+                row.appendChild(picker);
+                row.appendChild(gearBtn);
+
+                // Detail panel: Width and Opacity sliders (hidden until gear clicked)
+                const detail = document.createElement('div');
+                detail.classList.add('qol-color-detail');
+
+                // Width slider row
+                const widthRow = document.createElement('div');
+                widthRow.classList.add('qol-color-slider-row');
+
+                const widthLbl = document.createElement('label');
+                widthLbl.classList.add('qol-color-detail-label');
+                widthLbl.htmlFor = def.id + '-weight';
+                widthLbl.textContent = 'Width:';
+
+                const weightInput = document.createElement('input');
+                weightInput.type = 'range';
+                weightInput.id = def.id + '-weight';
+                weightInput.classList.add('qol-color-slider');
+                weightInput.value = colors[def.key].weight;
+                weightInput.min = '1';
+                weightInput.max = '12';
+                weightInput.step = '1';
+                weightInput.disabled = !colors[def.key].enabled;
+                weightInput.title = 'Line width (1–12 px)';
+
+                const widthVal = document.createElement('span');
+                widthVal.classList.add('qol-color-slider-val');
+                widthVal.textContent = colors[def.key].weight;
+
+                widthRow.appendChild(widthLbl);
+                widthRow.appendChild(weightInput);
+                widthRow.appendChild(widthVal);
+
+                // Opacity slider row
+                const opacityRow = document.createElement('div');
+                opacityRow.classList.add('qol-color-slider-row');
+
+                const opacityLbl = document.createElement('label');
+                opacityLbl.classList.add('qol-color-detail-label');
+                opacityLbl.htmlFor = def.id + '-opacity';
+                opacityLbl.textContent = 'Opacity:';
+
+                // Slider works in whole % steps (0–100); stored value is divided by 100
+                const opacityInput = document.createElement('input');
+                opacityInput.type = 'range';
+                opacityInput.id = def.id + '-opacity';
+                opacityInput.classList.add('qol-color-slider');
+                opacityInput.value = Math.round(colors[def.key].opacity * 100);
+                opacityInput.min = '0';
+                opacityInput.max = '100';
+                opacityInput.step = '5';
+                opacityInput.disabled = !colors[def.key].enabled;
+                opacityInput.title = 'Opacity';
+
+                const opacityVal = document.createElement('span');
+                opacityVal.classList.add('qol-color-slider-val');
+                opacityVal.textContent = Math.round(colors[def.key].opacity * 100) + '%';
+
+                opacityRow.appendChild(opacityLbl);
+                opacityRow.appendChild(opacityInput);
+                opacityRow.appendChild(opacityVal);
+
+                detail.appendChild(widthRow);
+                detail.appendChild(opacityRow);
+
+                gearBtn.addEventListener('click', function () {
+                    const open = detail.classList.toggle('open');
+                    gearBtn.classList.toggle('open', open);
+                });
+
+                checkbox.addEventListener('change', function () {
+                    const on = this.checked;
+                    picker.disabled = !on;
+                    weightInput.disabled = !on;
+                    opacityInput.disabled = !on;
+                    const current = loadHighlightColors();
+                    current[def.key].enabled = on;
+                    saveHighlightColors(current);
+                    refreshEquipmentTree();
+                });
+
+                // Use 'change' (fires when picker closes) not 'input' (fires on every
+                // drag step) - colors bake at tree-build time so live preview isn't
+                // possible, and 'input' would trigger excessive tree rebuilds.
+                picker.addEventListener('change', function () {
+                    const current = loadHighlightColors();
+                    current[def.key].value = this.value;
+                    saveHighlightColors(current);
+                    refreshEquipmentTree();
+                });
+
+                weightInput.addEventListener('input', function () {
+                    widthVal.textContent = this.value;
+                });
+                weightInput.addEventListener('change', function () {
+                    const current = loadHighlightColors();
+                    current[def.key].weight = parseInt(this.value, 10);
+                    saveHighlightColors(current);
+                    refreshEquipmentTree();
+                });
+
+                opacityInput.addEventListener('input', function () {
+                    opacityVal.textContent = this.value + '%';
+                });
+                opacityInput.addEventListener('change', function () {
+                    const current = loadHighlightColors();
+                    current[def.key].opacity = parseInt(this.value, 10) / 100;
+                    saveHighlightColors(current);
+                    refreshEquipmentTree();
+                });
+
+                section.appendChild(row);
+                section.appendChild(detail);
+            });
+
+            menu.appendChild(section);
+        })();
 
         // Insert the menu just after the header content
         headerContent.parentNode.insertAdjacentElement("afterend", menu);
@@ -3131,7 +3501,10 @@
                 };
             };
 
-            treeViews.forEach((tv, idx) => patchOne(tv, idx === 0 ? 'struct' : 'route'));
+            treeViews.forEach((tv, idx) => {
+                patchOne(tv, idx === 0 ? 'struct' : 'route');
+                applyGeomRepForPatch(tv);
+            });
 
             cableTreePatched = true;
             return true;
@@ -4910,7 +5283,6 @@
                         conn.to_cable_side,
                         toCableColor
                     );
-
                     // Update nodes for connection (avoiding problems with broken data)
                     for (let pin = conn.from_pins.low; pin <= conn.from_pins.high; pin++) {
                         const node = pinNodes[pin];
@@ -4946,7 +5318,11 @@
             };
 
             Object.defineProperty(treeView, '__addPinConnectionInfoPatched', { value: true });
-            console.info('[userscript] Patched equipmentTree.treeView._addPinConnectionInfo');
+
+            // Apply custom hover highlight colors via geomRepFor patch.
+            applyGeomRepForPatch(treeView);
+
+            console.info('[userscript] Patched equipmentTree.treeView._addPinConnectionInfo + geomRepFor');
         }
 
 
@@ -5485,6 +5861,29 @@
             console.info('[QOL] Plugin Patches: _copyCoordinate patched');
         }
 
+        async function patchCableTreeGeomRepFor() {
+            // Patch geomRepFor on cable tree views independently of the Terminations
+            // feature, so custom hover highlight colors work in the Cables section
+            // even when Auto Terminations is disabled.
+            const getCableTree = () => {
+                try {
+                    const ct = window.myw?.app?.plugins?.cableTree;
+                    if (!ct) return null;
+                    const views = [ct.structCableTreeView, ct.routeTreeView].filter(Boolean);
+                    return views.length ? ct : null;
+                } catch { return null; }
+            };
+            let ct;
+            try {
+                ct = await waitFor(getCableTree, { timeoutMs: 30000, intervalMs: 1000 });
+            } catch (e) {
+                console.warn('[userscript] cableTree not available for geomRepFor patch');
+                return;
+            }
+            [ct.structCableTreeView, ct.routeTreeView].forEach(tv => applyGeomRepForPatch(tv));
+            console.info('[userscript] Patched cableTree geomRepFor (independent path)');
+        }
+
         async function applyPatches() {
             try { 
                 await Promise.all([
@@ -5492,7 +5891,8 @@
                     patchLocManager(), 
                     // patchEquipmentTreeSaveState(),
                     patchStructureManager(),
-                    patchAddPinConnectionInfo()
+                    patchAddPinConnectionInfo(),
+                    patchCableTreeGeomRepFor()
                 ]);
                 patchCopyCoordinate();
             } catch (e) { 
