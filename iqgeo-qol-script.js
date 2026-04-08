@@ -500,6 +500,20 @@
             color: #fff; /* Change button text color */
         }
 
+        /* Anchor the wrapper to the right side of the header via absolute positioning so it
+           cannot be displaced by the toolbar regardless of CSS reflow timing during resize. */
+        #header-content {
+            position: relative;
+        }
+        .qol-header-wrapper {
+            position: absolute;
+            right: 0;
+            top: 0;
+            height: 100%;
+            display: flex;
+            align-items: center;
+        }
+
         .floating-menu {
             position: fixed;
             top: 52px;
@@ -984,6 +998,7 @@
         // Create the wrapper div
         var wrapperDiv = document.createElement("div");
         wrapperDiv.classList.add("right"); // Add the 'right' class
+        wrapperDiv.classList.add("qol-header-wrapper"); // Marker class for width measurement
 
         // Find the logo element
         var logo = document.querySelector(".logo-large");
@@ -1052,6 +1067,62 @@
         function getToggleInputByLabel(label) {
             var inputId = "toggle-" + label.replace(/\s+/g, "-").toLowerCase();
             return document.getElementById(inputId);
+        }
+
+        // Patch the toolbar control's addButtons method so the overflow chevron fires sooner,
+        // reserving space for the QOL menu button and logo on the right side of the header.
+        // The existing window resize handler in ToolbarControl calls this.addButtons() on the
+        // instance, so patching the instance method is enough to cover all future resizes.
+        function patchToolbarAvailableWidth() {
+            var attempts = 0;
+            var maxAttempts = 10;
+            function tryPatch() {
+                var tc = window.myw?.app?.layout?.controls?.toolbar;
+                if (!tc) {
+                    attempts++;
+                    if (attempts < maxAttempts) {
+                        setTimeout(tryPatch, 200);
+                    } else {
+                        console.warn('[userscript] Could not patch toolbar width: toolbar control not found');
+                    }
+                    return;
+                }
+
+                // Walk two prototype hops (instance -> ToolbarControl.prototype -> Control.prototype)
+                // to reach Control.prototype.addButtons, which is what the original super.addButtons() call resolves to.
+                var superAddButtons = Object.getPrototypeOf(Object.getPrototypeOf(tc)).addButtons;
+                if (typeof superAddButtons !== 'function') {
+                    console.warn('[userscript] Could not patch toolbar width: Control.prototype.addButtons not found');
+                    return;
+                }
+
+                // Cached once: the wrapper has a fixed size and re-measuring mid-resize
+                // risks reading a stale value while the toolbar DOM is being rebuilt.
+                var cachedRightSideWidth = null;
+
+                tc.addButtons = function () {
+                    var searchControl = this.app.layout.controls.search;
+                    var searchBarWidth = searchControl?.$el
+                        ? this.app.layout.controls.search.$el.outerWidth()
+                        : 0;
+
+                    if (cachedRightSideWidth === null) {
+                        var wrapper = document.querySelector('.qol-header-wrapper');
+                        cachedRightSideWidth = wrapper ? wrapper.offsetWidth : ($('#logo').outerWidth() || 0);
+                    }
+
+                    var availableWidth = $(window).width() - searchBarWidth - cachedRightSideWidth;
+                    superAddButtons.call(this, this.$el, this.options.buttons, {}, availableWidth, 46);
+                };
+
+                // Recalculate immediately so the correction takes effect without waiting for a resize.
+                tc.addButtons();
+            }
+            tryPatch();
+        }
+
+        if (window.myw?.appReady) {
+            window.myw.appReady.then(patchToolbarAvailableWidth);
         }
     }
     if (IS_MYWCOM) {
