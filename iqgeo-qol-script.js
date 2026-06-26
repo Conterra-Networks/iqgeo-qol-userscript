@@ -5276,6 +5276,158 @@
 
         let addPinConnectionPatchRetryId = null;
         let copyCoordinatePatchRetryId = null;
+        let refreshLazyPatchRetryId = null;
+        let treeFeaturePayloadGuardRetryId = null;
+
+        // TEMP HOTFIX (IQG-34445): keep FeatureTreeView.refreshFor lazy-aware.
+        // Remove when upstream refreshFor matches renderFor lazy-loading behavior.
+        async function patchFeatureTreeRefreshLazy() {
+            let treeView;
+            try {
+                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
+            } catch (e) {
+                if (!refreshLazyPatchRetryId) {
+                    refreshLazyPatchRetryId = setInterval(() => {
+                        const tv = getEquipTreeView();
+                        if (tv && !tv.__refreshForLazyPatched) {
+                            clearInterval(refreshLazyPatchRetryId);
+                            refreshLazyPatchRetryId = null;
+                            patchFeatureTreeRefreshLazy();
+                        }
+                    }, 5000);
+                }
+                return;
+            }
+
+            if (!treeView || treeView.__refreshForLazyPatched) return;
+
+            const originalRefreshFor = treeView.refreshFor;
+            if (typeof originalRefreshFor !== 'function') {
+                console.warn('[userscript] equipmentTree.treeView.refreshFor not a function');
+                return;
+            }
+
+            treeView.refreshFor = async function(feature) {
+                const tree = this.jstree();
+                if (tree) {
+                    const treeData = await this.getTreesFor(feature);
+                    const treeViewInstance = this;
+
+                    tree.settings.core.data = async function(node, cb) {
+                        if (node.id === '#') {
+                            return cb(treeData);
+                        }
+
+                        if (typeof treeViewInstance.childrenForNode === 'function') {
+                            return cb(await treeViewInstance.childrenForNode(node));
+                        }
+
+                        return cb([]);
+                    };
+
+                    tree.refresh();
+                }
+
+                this.filter();
+            };
+
+            Object.defineProperty(treeView, '__refreshForLazyPatched', {
+                value: { original: originalRefreshFor }
+            });
+            console.info('[userscript] Patched equipmentTree.treeView.refreshFor for lazy loading');
+        }
+
+        // TEMP HOTFIX (IQG-34445): guard missing tree-feature-modified payloads.
+        // Remove when upstream always emits a payload object for this event.
+        async function patchTreeFeatureModifiedPayloadGuard() {
+            let treeView;
+            try {
+                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
+            } catch (e) {
+                if (!treeFeaturePayloadGuardRetryId) {
+                    treeFeaturePayloadGuardRetryId = setInterval(() => {
+                        const tv = getEquipTreeView();
+                        if (tv && !tv.__treeFeaturePayloadGuardPatched) {
+                            clearInterval(treeFeaturePayloadGuardRetryId);
+                            treeFeaturePayloadGuardRetryId = null;
+                            patchTreeFeatureModifiedPayloadGuard();
+                        }
+                    }, 5000);
+                }
+                return;
+            }
+
+            if (!treeView || treeView.__treeFeaturePayloadGuardPatched) return;
+
+            const app = treeView.app || window.myw?.app;
+            if (!app || typeof app.on !== 'function') {
+                console.warn('[userscript] Could not patch tree-feature-modified guard: app.on not available');
+                return;
+            }
+
+            const wrapExistingTreeFeatureListeners = () => {
+                const events = app._events;
+                if (!events || !events['tree-feature-modified']) return;
+
+                const handlers = Array.isArray(events['tree-feature-modified'])
+                    ? events['tree-feature-modified']
+                    : [events['tree-feature-modified']];
+
+                handlers.forEach(entry => {
+                    if (!entry || typeof entry.callback !== 'function' || entry.__qolPayloadGuardWrapped) {
+                        return;
+                    }
+
+                    const originalCallback = entry.callback;
+                    entry.callback = function(data, ...rest) {
+                        return originalCallback.call(this, data || {}, ...rest);
+                    };
+                    entry.__qolPayloadGuardWrapped = true;
+                });
+            };
+
+            const originalInitRefreshHandlers = treeView.initRefreshHandlers;
+            if (typeof originalInitRefreshHandlers !== 'function') {
+                console.warn('[userscript] equipmentTree.treeView.initRefreshHandlers not a function');
+                return;
+            }
+
+            treeView.initRefreshHandlers = function patchedInitRefreshHandlers() {
+                if (this.__qolDbViewChangedHandler) {
+                    this.app.off('database-view-changed', this.__qolDbViewChangedHandler);
+                }
+                if (this.__qolTreeFeatureModifiedHandler) {
+                    this.app.off('tree-feature-modified', this.__qolTreeFeatureModifiedHandler);
+                }
+
+                this.__qolDbViewChangedHandler = () => {
+                    this.refreshFor(this.feature);
+                };
+
+                this.__qolTreeFeatureModifiedHandler = (data) => {
+                    if (data?.feature) {
+                        this.feature = data.feature;
+                    }
+                    this.refreshFor(this.feature);
+                };
+
+                this.app.on('database-view-changed', this.__qolDbViewChangedHandler);
+                this.app.on('tree-feature-modified', this.__qolTreeFeatureModifiedHandler);
+            };
+
+            wrapExistingTreeFeatureListeners();
+
+            try {
+                treeView.initRefreshHandlers();
+            } catch (e) {
+                console.warn('[userscript] tree-feature payload guard installed, but immediate rebind failed', e);
+            }
+
+            Object.defineProperty(treeView, '__treeFeaturePayloadGuardPatched', {
+                value: { original: originalInitRefreshHandlers }
+            });
+            console.info('[userscript] Patched equipmentTree.treeView.initRefreshHandlers payload guard');
+        }
 
         async function patchAddPinConnectionInfo() {
             // Try with a reasonable initial timeout
@@ -5981,6 +6133,8 @@
         async function applyPatches() {
             try { 
                 await Promise.all([
+                    patchFeatureTreeRefreshLazy(),
+                    patchTreeFeatureModifiedPayloadGuard(),
                     patchDisplayManager(), 
                     patchLocManager(), 
                     // patchEquipmentTreeSaveState(),
@@ -6019,6 +6173,16 @@
             if (copyCoordinatePatchRetryId) {
                 clearInterval(copyCoordinatePatchRetryId);
                 copyCoordinatePatchRetryId = null;
+            }
+
+            if (refreshLazyPatchRetryId) {
+                clearInterval(refreshLazyPatchRetryId);
+                refreshLazyPatchRetryId = null;
+            }
+
+            if (treeFeaturePayloadGuardRetryId) {
+                clearInterval(treeFeaturePayloadGuardRetryId);
+                treeFeaturePayloadGuardRetryId = null;
             }
             
             // Clear debounce timer
