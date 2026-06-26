@@ -5955,6 +5955,29 @@
             console.info('[userscript] Patched cableTree geomRepFor (independent path)');
         }
 
+        async function patchStreetviewPlugin() {
+            const sv = await waitFor(() => window.myw?.app?.plugins?.streetview || null);
+            if (!sv || sv.__svCollapsePatchApplied) return;
+
+            // smallSvControl is created lazily by the details panel - wait for it
+            await waitFor(() => sv.smallSvControl || null);
+
+            // Collapse immediately for this session
+            sv.smallSvControl.collapse();
+
+            // Prevent IQGeo persisting the expanded state across reloads
+            sv.getState = () => ({ collapsed: true });
+
+            // Collapse synchronously on feature change - before the async findPano() gap -
+            // so the panel never flashes expanded between feature selections.
+            sv.app.on('currentFeature-changed', () => {
+                if (sv.smallSvControl) sv.smallSvControl.collapse();
+            });
+
+            Object.defineProperty(sv, '__svCollapsePatchApplied', { value: true });
+            console.info('[userscript] Patched streetviewPlugin: always collapsed');
+        }
+
         async function applyPatches() {
             try { 
                 await Promise.all([
@@ -5963,7 +5986,8 @@
                     // patchEquipmentTreeSaveState(),
                     patchStructureManager(),
                     patchAddPinConnectionInfo(),
-                    patchCableTreeGeomRepFor()
+                    patchCableTreeGeomRepFor(),
+                    patchStreetviewPlugin()
                 ]);
                 patchCopyCoordinate();
             } catch (e) { 
