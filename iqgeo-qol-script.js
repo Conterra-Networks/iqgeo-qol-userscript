@@ -5310,12 +5310,16 @@
             treeView.refreshFor = async function(feature) {
                 const tree = this.jstree();
                 if (tree) {
-                    const treeData = await this.getTreesFor(feature);
+                    const treeData = await this.getTreesFor(feature, true);
                     const treeViewInstance = this;
 
                     tree.settings.core.data = async function(node, cb) {
                         if (node.id === '#') {
                             return cb(treeData);
+                        }
+
+                        if (!node || !node.data || typeof node.data.lazy_builder !== 'function') {
+                            return cb([]);
                         }
 
                         if (typeof treeViewInstance.childrenForNode === 'function') {
