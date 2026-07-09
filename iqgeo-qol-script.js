@@ -6134,6 +6134,52 @@
             console.info('[userscript] Patched streetviewPlugin: always collapsed');
         }
 
+        // Fix trace result hover tooltips: segment_ids from the server is a
+        // compact comma-separated string with no spacing, causing the popup to
+        // overflow off-screen. Adds spaces after commas and constrains tooltip
+        // width via CSS so the text wraps correctly.
+        async function patchTraceTooltipSegIds() {
+            let map;
+            try {
+                map = await waitFor(() => {
+                    const m = window.myw?.app?.map;
+                    return (typeof m?._showTooltip === 'function') ? m : null;
+                }, { timeoutMs: 30000, intervalMs: 1000 });
+            } catch (_) {
+                console.warn('[userscript] map._showTooltip not found - trace tooltip patch skipped');
+                return;
+            }
+
+            const MapControl = map.constructor;
+            if (MapControl.prototype._qolTooltipPatched) return;
+
+            // position:static removes the shrink-wrap that defeats max-width.
+            // white-space:normal overrides the upstream nowrap rule.
+            // !important beats the high-specificity IQGeo SCSS selector.
+            const style = document.createElement('style');
+            style.textContent = [
+                '.feature-tooltip { position: static !important; max-width: 400px !important; }',
+                '.feature-tooltip dd { white-space: normal !important; }'
+            ].join('\n');
+            document.head.appendChild(style);
+
+            const origShowTooltip = MapControl.prototype._showTooltip;
+            MapControl.prototype._showTooltip = function (event) {
+                origShowTooltip.call(this, event);
+                if (!this._isTooltipVisible || !this._tooltipElement) return;
+                this._tooltipElement.querySelectorAll('dd').forEach(function (dd) {
+                    // Only touch plain text <dd> nodes - skip those with nested HTML
+                    if (dd.childNodes.length !== 1 || dd.childNodes[0].nodeType !== Node.TEXT_NODE) return;
+                    const textNode = dd.childNodes[0];
+                    if (/,\d/.test(textNode.nodeValue)) {
+                        textNode.nodeValue = textNode.nodeValue.replace(/,(?=\d)/g, ', ');
+                    }
+                });
+            };
+            MapControl.prototype._qolTooltipPatched = true;
+            console.info('[userscript] Patched MapControl._showTooltip: trace tooltip segment ID fix');
+        }
+
         async function applyPatches() {
             try { 
                 await Promise.all([
@@ -6145,7 +6191,8 @@
                     patchStructureManager(),
                     patchAddPinConnectionInfo(),
                     patchCableTreeGeomRepFor(),
-                    patchStreetviewPlugin()
+                    patchStreetviewPlugin(),
+                    patchTraceTooltipSegIds()
                 ]);
                 patchCopyCoordinate();
             } catch (e) { 
