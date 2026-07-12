@@ -2947,8 +2947,8 @@
                 if (side.type == "cable") { // Use end structure instead of cable segment
                     featureToSet = side == "in" ? side.structureData.in_structure : side.structureData.out_structure;
                 }
-                myw?.app?.setCurrentFeature(
-                    await myw.app.database.getFeatureByUrn(featureToSet), 
+                window.myw?.app?.setCurrentFeature(
+                    await window.myw.app.database.getFeatureByUrn(featureToSet),
                     { zoomTo: true, keepFeatureSet: true, edit: false, notify: true }
                 );
             });
@@ -5941,7 +5941,7 @@
             const originalGetTreesFor = treeView.getTreesFor;
             treeView.getTreesFor = async function(feature, lazyBuild = false) {
                 // Get the root housing to determine rootUrn for this structure
-                const struct = await this.getRootHousing(feature);
+                const struct = await feature.getRootHousing();
                 const currentRootUrn = struct.getUrn();
                 
                 // If structure changed, load saved state before building tree
@@ -6187,7 +6187,7 @@
                     patchTreeFeatureModifiedPayloadGuard(),
                     patchDisplayManager(), 
                     patchLocManager(), 
-                    // patchEquipmentTreeSaveState(),
+                    patchEquipmentTreeSaveState(),
                     patchStructureManager(),
                     patchAddPinConnectionInfo(),
                     patchCableTreeGeomRepFor(),
