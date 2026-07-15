@@ -5236,6 +5236,70 @@
         });
     }
 
+    // Shared utility: apply a monkey-patch as soon as its target becomes available.
+    // One interval covers every registered patch instead of each patch rolling its
+    // own waitFor/setTimeout/retry-id boilerplate.
+    const patchPollQueue = [];
+    let patchPollTimerId = null;
+
+    function tryApplyPatch(entry) {
+        let target;
+        try {
+            target = entry.getTarget();
+        } catch {
+            return false;
+        }
+        if (!target) return false;
+        if (entry.isPatched(target)) return true;
+
+        try {
+            entry.apply(target);
+        } catch (e) {
+            if (!entry.hasLoggedFailure) {
+                console.error(`[userscript] Failed to apply patch (${entry.label}), will keep retrying:`, e);
+                entry.hasLoggedFailure = true;
+            }
+            return false; // apply() threw - target wasn't actually ready, keep polling
+        }
+
+        if (entry.isPatched(target)) return true;
+
+        // apply() ran without throwing but didn't mark the target patched - one of
+        // its internal preconditions (e.g. a method not yet attached) wasn't met.
+        // Keep polling instead of silently abandoning the patch; only warn once.
+        if (!entry.hasLoggedFailure) {
+            console.warn(`[userscript] Patch target found but not fully ready, will keep retrying (${entry.label})`);
+            entry.hasLoggedFailure = true;
+        }
+        return false;
+    }
+
+    function registerPatch(getTarget, isPatched, apply, label) {
+        const entry = { getTarget, isPatched, apply, label };
+        if (tryApplyPatch(entry)) return;
+
+        patchPollQueue.push(entry);
+        if (!patchPollTimerId) {
+            patchPollTimerId = setInterval(() => {
+                for (let i = patchPollQueue.length - 1; i >= 0; i--) {
+                    if (tryApplyPatch(patchPollQueue[i])) patchPollQueue.splice(i, 1);
+                }
+                if (!patchPollQueue.length) {
+                    clearInterval(patchPollTimerId);
+                    patchPollTimerId = null;
+                }
+            }, 2000);
+        }
+    }
+
+    function stopPatchPolling() {
+        patchPollQueue.length = 0;
+        if (patchPollTimerId) {
+            clearInterval(patchPollTimerId);
+            patchPollTimerId = null;
+        }
+    }
+
     // Plugin Overrides: displayManager, locManager
     const pluginOverridesFeature = (() => {
         'use strict';
@@ -5274,37 +5338,12 @@
             }
         };
 
-        let addPinConnectionPatchRetryId = null;
-        let copyCoordinatePatchRetryId = null;
-        let refreshLazyPatchRetryId = null;
-        let treeFeaturePayloadGuardRetryId = null;
-
         // TEMP HOTFIX (IQG-34445): keep FeatureTreeView.refreshFor lazy-aware.
         // Remove when upstream refreshFor matches renderFor lazy-loading behavior.
-        async function patchFeatureTreeRefreshLazy() {
-            let treeView;
-            try {
-                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (e) {
-                if (!refreshLazyPatchRetryId) {
-                    refreshLazyPatchRetryId = setInterval(() => {
-                        const tv = getEquipTreeView();
-                        if (tv && !tv.__refreshForLazyPatched) {
-                            clearInterval(refreshLazyPatchRetryId);
-                            refreshLazyPatchRetryId = null;
-                            patchFeatureTreeRefreshLazy();
-                        }
-                    }, 5000);
-                }
-                return;
-            }
-
-            if (!treeView || treeView.__refreshForLazyPatched) return;
-
+        function applyFeatureTreeRefreshLazy(treeView) {
             const originalRefreshFor = treeView.refreshFor;
             if (typeof originalRefreshFor !== 'function') {
-                console.warn('[userscript] equipmentTree.treeView.refreshFor not a function');
-                return;
+                throw new Error('equipmentTree.treeView.refreshFor not a function');
             }
 
             treeView.refreshFor = async function(feature) {
@@ -5343,30 +5382,10 @@
 
         // TEMP HOTFIX (IQG-34445): guard missing tree-feature-modified payloads.
         // Remove when upstream always emits a payload object for this event.
-        async function patchTreeFeatureModifiedPayloadGuard() {
-            let treeView;
-            try {
-                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (e) {
-                if (!treeFeaturePayloadGuardRetryId) {
-                    treeFeaturePayloadGuardRetryId = setInterval(() => {
-                        const tv = getEquipTreeView();
-                        if (tv && !tv.__treeFeaturePayloadGuardPatched) {
-                            clearInterval(treeFeaturePayloadGuardRetryId);
-                            treeFeaturePayloadGuardRetryId = null;
-                            patchTreeFeatureModifiedPayloadGuard();
-                        }
-                    }, 5000);
-                }
-                return;
-            }
-
-            if (!treeView || treeView.__treeFeaturePayloadGuardPatched) return;
-
+        function applyTreeFeatureModifiedPayloadGuard(treeView) {
             const app = treeView.app || window.myw?.app;
             if (!app || typeof app.on !== 'function') {
-                console.warn('[userscript] Could not patch tree-feature-modified guard: app.on not available');
-                return;
+                throw new Error('tree-feature-modified guard: app.on not available');
             }
 
             const wrapExistingTreeFeatureListeners = () => {
@@ -5392,8 +5411,7 @@
 
             const originalInitRefreshHandlers = treeView.initRefreshHandlers;
             if (typeof originalInitRefreshHandlers !== 'function') {
-                console.warn('[userscript] equipmentTree.treeView.initRefreshHandlers not a function');
-                return;
+                throw new Error('equipmentTree.treeView.initRefreshHandlers not a function');
             }
 
             treeView.initRefreshHandlers = function patchedInitRefreshHandlers() {
@@ -5433,32 +5451,10 @@
             console.info('[userscript] Patched equipmentTree.treeView.initRefreshHandlers payload guard');
         }
 
-        async function patchAddPinConnectionInfo() {
-            // Try with a reasonable initial timeout
-            let treeView;
-            try {
-                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (e) {
-                // If initial attempt fails, set up periodic retry
-                if (!addPinConnectionPatchRetryId) {
-                    addPinConnectionPatchRetryId = setInterval(() => {
-                        const tv = getEquipTreeView();
-                        if (tv && !tv.__addPinConnectionInfoPatched) {
-                            clearInterval(addPinConnectionPatchRetryId);
-                            addPinConnectionPatchRetryId = null;
-                            patchAddPinConnectionInfo();
-                        }
-                    }, 5000);
-                }
-                return;
-            }
-
-            if (!treeView || treeView.__addPinConnectionInfoPatched) return;
-
+        function applyAddPinConnectionInfo(treeView) {
             const original_addPinConnectionInfo = treeView._addPinConnectionInfo;
             if (typeof original_addPinConnectionInfo !== 'function') {
-                console.warn('[userscript] equipmentTree.treeView._addPinConnectionInfo not a function');
-                return;
+                throw new Error('equipmentTree.treeView._addPinConnectionInfo not a function');
             }
 
             treeView._addPinConnectionInfo = function(pinNodes, conns, cable, color2) {
@@ -5553,10 +5549,7 @@
         }
 
 
-        async function patchDisplayManager() {
-            const dm = await waitFor(getDisplayManager);
-            if (!dm || dm.__connLabelPatchedSimple) return;
-
+        function applyDisplayManagerPatch(dm) {
             // Override _proposedText to conditionally use different color for current delta
             const original_proposedText = dm._proposedText;
             dm._proposedText = function(text, deltaDesc = null, conn = null) {
@@ -5704,10 +5697,7 @@
             console.info('[userscript] Patched displayManager._connLabel, _proposedText, connLabel, and spliceLabel');
         }
 
-        async function patchLocManager() {
-            const lm = await waitFor(getLocManager);
-            if (!lm || lm.__getFeatureLOCDetailsAtPatched) return;
-
+        function applyLocManagerPatch(lm) {
             // Keep async signature so callers using await remain compatible
             lm.getFeatureLOCDetailsAt = async function (struct, features, segments = true, include_proposed = false) {
                 return {};
@@ -5717,33 +5707,11 @@
             console.info('[userscript] Patched locManager.getFeatureLOCDetailsAt');
         }
 
-        let saveStatePatchRetryId = null;
         let saveStateDebounceTimer = null;
         const DEBUG_SAVESTATE = false; // Set to true for diagnostic logging
         const SAVE_DEBOUNCE_MS = 500; // Wait 500ms after last change before writing to localStorage
 
-        async function patchEquipmentTreeSaveState() {
-            // Try with a reasonable initial timeout
-            let treeView;
-            try {
-                treeView = await waitFor(getEquipTreeView, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (e) {
-                // If initial attempt fails, set up periodic retry
-                if (!saveStatePatchRetryId) {
-                    saveStatePatchRetryId = setInterval(() => {
-                        const tv = getEquipTreeView();
-                        if (tv && !tv.__saveStatePatched) {
-                            clearInterval(saveStatePatchRetryId);
-                            saveStatePatchRetryId = null;
-                            patchEquipmentTreeSaveState();
-                        }
-                    }, 5000);
-                }
-                return;
-            }
-
-            if (!treeView || treeView.__saveStatePatched) return;
-
+        function applyEquipmentTreeSaveState(treeView) {
             // localStorage persistence constants
             const STORAGE_KEY = 'qol-tree-state';
             const MAX_STRUCTURES = 10; // Keep last 10 structures
@@ -5998,14 +5966,10 @@
         //     treeView.__restoreTriggerPollIdV2 = setInterval(bindNow, 1000);
         // }
 
-        async function patchStructureManager() {
-            const sm = await waitFor(getStructureManager);
-            if (!sm || sm.__structContentPatched) return;
-
+        function applyStructureManagerPatch(sm) {
             const original = sm.structContent;
             if (typeof original !== 'function') {
-                console.warn('[userscript] structureManager.structContent not a function');
-                return;
+                throw new Error('structureManager.structContent not a function');
             }
 
             // Replace with a delegating wrapper (preserves scope of StructContents called within original structContent)
@@ -6048,24 +6012,12 @@
             console.info('[userscript] Patched structureManager.structContent (delegating, no direct StructContents)');
         }
 
-        function patchCopyCoordinate() {
-            const map = window.myw?.app?.map;
-            if (!map || typeof map._copyCoordinate !== 'function') {
-                if (!copyCoordinatePatchRetryId) {
-                    copyCoordinatePatchRetryId = setInterval(() => {
-                        const m = window.myw?.app?.map;
-                        if (m && typeof m._copyCoordinate === 'function' && !m.__copyCoordinatePatched) {
-                            clearInterval(copyCoordinatePatchRetryId);
-                            copyCoordinatePatchRetryId = null;
-                            patchCopyCoordinate();
-                        }
-                    }, 5000);
-                }
-                return;
-            }
+        const getMapForCopyCoordinate = () => {
+            const m = window.myw?.app?.map;
+            return (m && typeof m._copyCoordinate === 'function') ? m : null;
+        };
 
-            if (map.__copyCoordinatePatched) return;
-
+        function applyCopyCoordinatePatch(map) {
             map._copyCoordinate = function (mapArg, location) {
                 // location.coordinate is [lng, lat] - swap to [lat, lng]
                 const lat = location.coordinate[1].toFixed(7);
@@ -6088,36 +6040,36 @@
             console.info('[QOL] Plugin Patches: _copyCoordinate patched');
         }
 
-        async function patchCableTreeGeomRepFor() {
-            // Patch geomRepFor on cable tree views independently of the Terminations
-            // feature, so custom hover highlight colors work in the Cables section
-            // even when Auto Terminations is disabled.
-            const getCableTree = () => {
-                try {
-                    const ct = window.myw?.app?.plugins?.cableTree;
-                    if (!ct) return null;
-                    const views = [ct.structCableTreeView, ct.routeTreeView].filter(Boolean);
-                    return views.length ? ct : null;
-                } catch { return null; }
-            };
-            let ct;
+        // Patch geomRepFor on cable tree views independently of the Terminations
+        // feature, so custom hover highlight colors work in the Cables section
+        // even when Auto Terminations is disabled.
+        const getCableTree = () => {
             try {
-                ct = await waitFor(getCableTree, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (e) {
-                console.warn('[userscript] cableTree not available for geomRepFor patch');
-                return;
-            }
-            [ct.structCableTreeView, ct.routeTreeView].forEach(tv => applyGeomRepForPatch(tv));
-            console.info('[userscript] Patched cableTree geomRepFor (independent path)');
+                const ct = window.myw?.app?.plugins?.cableTree;
+                if (!ct) return null;
+                const views = [ct.structCableTreeView, ct.routeTreeView].filter(Boolean);
+                return views.length ? ct : null;
+            } catch { return null; }
+        };
+        // structCableTreeView and routeTreeView can each appear at different times
+        // (e.g. routeTreeView only once the user opens the Routes section), so this
+        // is never considered permanently "done" - apply() is cheap and idempotent
+        // per-view, so it's fine to keep re-checking for the life of the session.
+        const isCableTreePatched = () => false;
+        function applyCableTreeGeomRepFor(ct) {
+            [ct.structCableTreeView, ct.routeTreeView].forEach(tv => {
+                if (!tv || tv.__geomRepForPatched) return;
+                applyGeomRepForPatch(tv);
+                console.info('[userscript] Patched cableTree geomRepFor (independent path)');
+            });
         }
 
-        async function patchStreetviewPlugin() {
-            const sv = await waitFor(() => window.myw?.app?.plugins?.streetview || null);
-            if (!sv || sv.__svCollapsePatchApplied) return;
-
-            // smallSvControl is created lazily by the details panel - wait for it
-            await waitFor(() => sv.smallSvControl || null);
-
+        const getStreetviewReady = () => {
+            const sv = window.myw?.app?.plugins?.streetview;
+            // smallSvControl is created lazily by the details panel - wait for it too
+            return (sv && sv.smallSvControl) ? sv : null;
+        };
+        function applyStreetviewPlugin(sv) {
             // Collapse immediately for this session
             sv.smallSvControl.collapse();
 
@@ -6138,20 +6090,12 @@
         // compact comma-separated string with no spacing, causing the popup to
         // overflow off-screen. Adds spaces after commas and constrains tooltip
         // width via CSS so the text wraps correctly.
-        async function patchTraceTooltipSegIds() {
-            let map;
-            try {
-                map = await waitFor(() => {
-                    const m = window.myw?.app?.map;
-                    return (typeof m?._showTooltip === 'function') ? m : null;
-                }, { timeoutMs: 30000, intervalMs: 1000 });
-            } catch (_) {
-                console.warn('[userscript] map._showTooltip not found - trace tooltip patch skipped');
-                return;
-            }
-
+        const getMapForTraceTooltip = () => {
+            const m = window.myw?.app?.map;
+            return (typeof m?._showTooltip === 'function') ? m : null;
+        };
+        function applyTraceTooltipSegIds(map) {
             const MapControl = map.constructor;
-            if (MapControl.prototype._qolTooltipPatched) return;
 
             // position:static removes the shrink-wrap that defeats max-width.
             // white-space:normal overrides the upstream nowrap rule.
@@ -6180,24 +6124,21 @@
             console.info('[userscript] Patched MapControl._showTooltip: trace tooltip segment ID fix');
         }
 
-        async function applyPatches() {
-            try { 
-                await Promise.all([
-                    patchFeatureTreeRefreshLazy(),
-                    patchTreeFeatureModifiedPayloadGuard(),
-                    patchDisplayManager(), 
-                    patchLocManager(), 
-                    patchEquipmentTreeSaveState(),
-                    patchStructureManager(),
-                    patchAddPinConnectionInfo(),
-                    patchCableTreeGeomRepFor(),
-                    patchStreetviewPlugin(),
-                    patchTraceTooltipSegIds()
-                ]);
-                patchCopyCoordinate();
-            } catch (e) { 
-                console.error('[userscript] Patching error:', e); 
-            }
+        function applyPatches() {
+            // Each entry is applied the instant its target becomes available - whether
+            // that's immediately on page load or only after the user opens a panel
+            // (e.g. equipmentTree/streetview are lazily created) minutes later.
+            registerPatch(getEquipTreeView, tv => !!tv.__refreshForLazyPatched, applyFeatureTreeRefreshLazy, 'refreshFor lazy');
+            registerPatch(getEquipTreeView, tv => !!tv.__treeFeaturePayloadGuardPatched, applyTreeFeatureModifiedPayloadGuard, 'tree-feature-modified payload guard');
+            registerPatch(getEquipTreeView, tv => !!tv.__addPinConnectionInfoPatched, applyAddPinConnectionInfo, 'addPinConnectionInfo');
+            registerPatch(getEquipTreeView, tv => !!tv.__saveStatePatched, applyEquipmentTreeSaveState, 'equipmentTree save state');
+            registerPatch(getDisplayManager, dm => !!dm.__connLabelPatchedSimple, applyDisplayManagerPatch, 'displayManager');
+            registerPatch(getLocManager, lm => !!lm.__getFeatureLOCDetailsAtPatched, applyLocManagerPatch, 'locManager');
+            registerPatch(getStructureManager, sm => !!sm.__structContentPatched, applyStructureManagerPatch, 'structureManager');
+            registerPatch(getCableTree, isCableTreePatched, applyCableTreeGeomRepFor, 'cableTree geomRepFor');
+            registerPatch(getStreetviewReady, sv => !!sv.__svCollapsePatchApplied, applyStreetviewPlugin, 'streetview collapse');
+            registerPatch(getMapForTraceTooltip, m => !!m.constructor.prototype._qolTooltipPatched, applyTraceTooltipSegIds, 'trace tooltip seg ids');
+            registerPatch(getMapForCopyCoordinate, m => !!m.__copyCoordinatePatched, applyCopyCoordinatePatch, 'copyCoordinate');
         }
 
         function start() {
@@ -6209,33 +6150,9 @@
         function stop() {
             if (!started) return;
             started = false;
-            
-            // Clean up retry intervals
-            if (saveStatePatchRetryId) {
-                clearInterval(saveStatePatchRetryId);
-                saveStatePatchRetryId = null;
-            }
-            
-            if (addPinConnectionPatchRetryId) {
-                clearInterval(addPinConnectionPatchRetryId);
-                addPinConnectionPatchRetryId = null;
-            }
 
-            if (copyCoordinatePatchRetryId) {
-                clearInterval(copyCoordinatePatchRetryId);
-                copyCoordinatePatchRetryId = null;
-            }
+            stopPatchPolling();
 
-            if (refreshLazyPatchRetryId) {
-                clearInterval(refreshLazyPatchRetryId);
-                refreshLazyPatchRetryId = null;
-            }
-
-            if (treeFeaturePayloadGuardRetryId) {
-                clearInterval(treeFeaturePayloadGuardRetryId);
-                treeFeaturePayloadGuardRetryId = null;
-            }
-            
             // Clear debounce timer
             if (saveStateDebounceTimer) {
                 clearTimeout(saveStateDebounceTimer);
