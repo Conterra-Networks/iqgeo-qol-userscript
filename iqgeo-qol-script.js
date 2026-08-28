@@ -6124,6 +6124,143 @@
             console.info('[userscript] Patched MapControl._showTooltip: trace tooltip segment ID fix');
         }
 
+        // TEMP HOTFIX (IQG-35186): /search endpoint returns 500s after upgrade to core v7.5.3, comms v3.6.7
+        // Restore partial search functionality using the local query-suggestion fast
+        // path designed for other datasource types which skips the server call.
+        // Free-text search with no canned match is unaffected and will still 500.
+        // Remove once the server-side /search regression is fixed.
+        const getMywDatasource = () => {
+            try {
+                return window.myw?.app?.database?.getDatasource('myworld') || null;
+            } catch { return null; }
+        };
+        function applySearchSuggestionsWorkaround(ds) {
+            ds.options.fullQuery = true;
+            ds.options.inWindowQuery = true;
+            ds.options.inSelectionQuery = true;
+
+            fetch('config/dd/myworld/queries', { credentials: 'same-origin' })
+                .then(res => {
+                    if (!res.ok) throw new Error(`config/dd/myworld/queries returned ${res.status}`);
+                    return res.json();
+                })
+                .then(({ queries = [] }) => {
+                    queries.forEach(row => {
+                        const featureDD = ds.featuresDD[row.feature_name];
+                        if (!featureDD) return;
+
+                        featureDD.queries = featureDD.queries || [];
+                        featureDD.queries.push({
+                            lang: row.lang,
+                            matched_value: row.myw_search_val1,
+                            display_value: row.myw_search_desc1,
+                            attrib_query: row.attrib_query
+                        });
+                    });
+                    Object.defineProperty(ds, '__searchSuggestionsWorkaroundPatched', { value: true });
+                    console.info('[userscript] TEMP: backfilled canned query suggestions for myworld datasource');
+                })
+                .catch(e => console.error('[userscript] TEMP: failed to backfill canned query suggestions', e));
+        }
+
+        // TEMP HOTFIX (IQG-35186): companion to the search-suggestions workaround above - adds
+        // a search-by-id provider so a bare id number can still resolve a feature while /search
+        // is down. Uses feature/{type}?filter=[id]={id} (RestServer.getFeatures), a separate
+        // endpoint from /search, so it isn't affected by the regression. Also short-circuits the
+        // built-in "myw" provider for numeric input so it stops eating a guaranteed 500 on every
+        // id search.
+        // Deliberately scoped to mywcom.cables/.routes/.structures/.equipment (~50 types) rather
+        // than every loaded feature type (~150) - covers realistic id lookups without the extra
+        // request fan-out. An id for a type outside those categories won't be found here.
+        // Remove alongside applySearchSuggestionsWorkaround once /search is fixed.
+        const getSearchControl = () => {
+            try { return window.myw?.app?.layout?.controls?.search || null; }
+            catch { return null; }
+        };
+        const ID_SEARCH_SETTLE_MS = 600;
+        const ID_SEARCH_PRIORITY_SETTINGS = ['mywcom.cables', 'mywcom.routes', 'mywcom.structures', 'mywcom.equipment'];
+        function applyIdSearchProvider(searchControl) {
+            const ds = getMywDatasource();
+            if (!ds) throw new Error('id search provider: myworld datasource not available');
+
+            const typePriority = new Map();
+            ID_SEARCH_PRIORITY_SETTINGS.forEach((settingKey, rank) => {
+                Object.keys(window.myw?.app?.system?.settings?.[settingKey] || {}).forEach(type => {
+                    if (!typePriority.has(type)) typePriority.set(type, rank);
+                });
+            });
+            const idSearchTypes = Array.from(typePriority.keys());
+
+            async function idSearchProvider(searchText) {
+                if (!/^\d+$/.test(searchText)) return [];
+
+                // Extra settle delay on top of SearchControl's own debounce, specific to this
+                // provider, so we don't fire a request per type for every digit typed.
+                await new Promise(resolve => setTimeout(resolve, ID_SEARCH_SETTLE_MS));
+                if (searchControl.getSearchText() !== searchText) return [];
+
+                const types = idSearchTypes;
+                const results = await Promise.allSettled(
+                    types.map(type => ds.getFeatures(type, { filter: `[id]=${searchText}`, limit: 1 }))
+                );
+
+                const suggestions = [];
+                let loggedFailure = false;
+                results.forEach((result, i) => {
+                    if (result.status === 'rejected') {
+                        if (!loggedFailure) {
+                            console.error('[userscript] TEMP: id search sweep failed for one or more types', result.reason);
+                            loggedFailure = true;
+                        }
+                        return;
+                    }
+                    if (!result.value.length) return;
+
+                    const type = types[i];
+                    suggestions.push({
+                        type: 'feature',
+                        label: `${result.value[0].getTitle()} (${type})`,
+                        value: searchText,
+                        data: { urn: `${type}/${searchText}` },
+                        datasource: 'myworld'
+                    });
+                });
+
+                suggestions.sort((a, b) => typePriority.get(a.data.urn.split('/')[0]) - typePriority.get(b.data.urn.split('/')[0]));
+                return suggestions;
+            }
+
+            // allSuggestions()/searchFor() both iterate Object.values(providers) to build the
+            // flat, displayed list in insertion order - a plain `providers.qolIdSearch = ...`
+            // would land after "places" (Google), since that's the last existing key. Rebuild
+            // the object instead so id results are inserted right after "myw", ahead of
+            // externals/places.
+            const qolIdSearchProviderEntry = {
+                type: 'qolIdSearch',
+                title: undefined,
+                search: idSearchProvider
+            };
+            const reorderedProviders = {};
+            Object.entries(searchControl.providers).forEach(([key, provider]) => {
+                reorderedProviders[key] = provider;
+                if (key === 'myw') reorderedProviders.qolIdSearch = qolIdSearchProviderEntry;
+            });
+            if (!reorderedProviders.qolIdSearch) reorderedProviders.qolIdSearch = qolIdSearchProviderEntry;
+            searchControl.providers = reorderedProviders;
+
+            // The built-in "myw" provider still fires on every search, including numeric ones -
+            // that's a guaranteed /search 500 for input the id search provider above already
+            // covers locally. Short-circuit it for numeric input instead of eating that request.
+            const originalMywSearch = searchControl.providers.myw?.search;
+            if (typeof originalMywSearch === 'function') {
+                searchControl.providers.myw.search = (searchText, bounds) =>
+                    /^\d+$/.test(searchText) ? Promise.resolve([]) : originalMywSearch(searchText, bounds);
+            }
+
+            Object.defineProperty(searchControl, '__idSearchProviderPatched', { value: true });
+            console.info('[userscript] Patched searchControl: id-number search provider (TEMP)');
+        }
+
         function applyPatches() {
             // Each entry is applied the instant its target becomes available - whether
             // that's immediately on page load or only after the user opens a panel
@@ -6139,6 +6276,8 @@
             registerPatch(getStreetviewReady, sv => !!sv.__svCollapsePatchApplied, applyStreetviewPlugin, 'streetview collapse');
             registerPatch(getMapForTraceTooltip, m => !!m.constructor.prototype._qolTooltipPatched, applyTraceTooltipSegIds, 'trace tooltip seg ids');
             registerPatch(getMapForCopyCoordinate, m => !!m.__copyCoordinatePatched, applyCopyCoordinatePatch, 'copyCoordinate');
+            registerPatch(getMywDatasource, ds => !!ds.__searchSuggestionsWorkaroundPatched, applySearchSuggestionsWorkaround, 'search suggestions workaround (TEMP)');
+            registerPatch(getSearchControl, sc => !!sc.__idSearchProviderPatched, applyIdSearchProvider, 'id search provider (TEMP)');
         }
 
         function start() {
