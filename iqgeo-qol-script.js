@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
     console.log("Conterra's IQGeo QOL Userscript Loaded");
 
     const iqgeoGreen = "#3CA22D";
@@ -40,9 +40,9 @@
     // Hybrid logging utility with per-feature control
     const logger = {
         _shouldLog: (feature, level) => {
-            if (!DEBUG_CONFIG.enabled) return level === 'error' || level === 'warn';
-            if (!feature) return DEBUG_CONFIG.enabled;
-            return DEBUG_CONFIG.features[feature] === true || DEBUG_CONFIG.enabled;
+            // A feature's own flag turns on its logging even with the master toggle off
+            if (feature && DEBUG_CONFIG.features[feature] === true) return true;
+            return DEBUG_CONFIG.enabled || level === 'error' || level === 'warn';
         },
         
         debug: (feature, ...args) => {
@@ -1184,6 +1184,7 @@
     let xhrInterceptEnabled = false;
     let xhrInterceptUsers = 0;
     let interceptPaused = 0;
+    const QOL_OWN_REQUEST = 'qolOwnRequest'; // fetch init flag; fetch ignores unknown init keys
 
     function enableXhrIntercept() {
         xhrInterceptUsers++;
@@ -1195,6 +1196,7 @@
         xhrInterceptEnabled = xhrInterceptUsers > 0;
     }
 
+    // eslint-disable-next-line no-unused-vars -- kept for the commented-out manhole intercept below
     function withInterceptPaused(fn) {
         interceptPaused++;
         let result;
@@ -1249,12 +1251,10 @@
             match = normalizedUrl.pathname.match(regexRouteContents);
             if (match && featureManager.isEnabled("Auto Terminations")) {
                 try {
-                    withInterceptPaused(() => {
-                        const data = JSON.parse(responseText);
-                        if (data) {
-                            featureBetterTerminations.getRouteSegments(data);
-                        }
-                    });
+                    const data = JSON.parse(responseText);
+                    if (data) {
+                        featureBetterTerminations.getRouteSegments(data);
+                    }
                 } catch (error) {
                     console.error(error);
                 }
@@ -1265,11 +1265,9 @@
             const regexSegmentTerms = /\/modules\/comms\/fiber\/paths\/(mywcom_fiber_segment\/\d+)/;
             match = normalizedUrl.pathname.match(regexSegmentTerms);
             if (match && featureManager.isEnabled("Auto Terminations")) {
-                withInterceptPaused(() => {
-                    const segment = match[1];
-                    const data = JSON.parse(responseText);
-                    featureBetterTerminations.getSegment({ segment: segment, interceptedData: data }, true);
-                });
+                const segment = match[1];
+                const data = JSON.parse(responseText);
+                featureBetterTerminations.getSegment({ segment: segment, interceptedData: data }, true);
                 return;
             }
         } catch (error) {
@@ -1309,9 +1307,11 @@
         // Fetch interception to catch additional requests not using XHR
         const origFetchIntercept = window.fetch;
         window.fetch = function (...args) {
+            // The script's own requests are tagged (QOL_OWN_REQUEST) so they aren't treated as IQGeo's
+            const ownRequest = args[1]?.[QOL_OWN_REQUEST] === true;
             return origFetchIntercept.apply(this, args).then((res) => {
                 // Skip non-successful responses (e.g., 500 error pages with HTML)
-                if (xhrInterceptEnabled && interceptPaused === 0 && res.ok) {
+                if (!ownRequest && xhrInterceptEnabled && interceptPaused === 0 && res.ok) {
                     const url = res?.url || args[0];
                     res.clone()
                         .text()
@@ -2457,9 +2457,13 @@
         const PORT = 'port';
         const FIBER_PATCH_PANEL = 'fiber_patch_panel';
         const FIBER_ONT = 'fiber_ont';
-        const TERMINATION_BATCH_SIZE = 12;
-        const TERMINATION_TIMEOUT_MS = 30000;
-        const TERMINATION_MAX_CONCURRENCY = 3;
+        // Trace cost is ~2.1 s per pin + ~1.5 s per request (measured 2026-11-08), so batch size
+        // barely changes total time; small batches limit the blast radius of a strand that errors
+        // and lets on-screen rows finish first. Timeout scales with pin count (~2.5x expected).
+        const TERMINATION_BATCH_SIZE = 6;
+        const TERMINATION_TIMEOUT_BASE_MS = 15000;
+        const TERMINATION_TIMEOUT_PER_PIN_MS = 5000;
+        const TERMINATION_MAX_CONCURRENCY = 5;
         const FEATURE_PROPERTIES = {
             'fiber_patch_panel': ['id', 'name', 'n_fiber_ports', 'root_housing'],
             'fiber_splitter': ['id', 'name', 'n_fiber_out_ports', 'device_id'],
@@ -2479,41 +2483,828 @@
             'fiber_demux': ['id', 'name']
         };
 
-        let forceRefresh = false;
         let termMutationObserver = null;
         const displayRetryCounts = new Map();
-        let cableTreePatched = false;
+        const patchedTreeViews = new WeakSet();
         let cableTreeShowPatched = false;
         const segmentBatchState = new Map(); // segment -> { strands: [], saved: number, fiberCount: number }
+        const failedPins = new Map(); // segment -> Map(pin -> reason) for traces that errored this session (retried on refresh/Clear)
 
-        // Cleanup stale cache data
-        Object.entries(localStorage).forEach(([k, v]) => {
-            if (k.includes("state")) return;
-            if (v.includes("saved") && v.includes("data")) {
-                purgeFeatureCache(k, 5);
+        // Traces and feature data differ per design, so localStorage entries are kept per design
+        // (`qol-term:<type>` in master, `qol-term:<type>@<design>` in a design) and the in-memory
+        // maps above only ever hold the current design. The prefix keeps the purge off other apps' keys.
+        const CACHE_KEY_PREFIX = 'qol-term:';
+        function designCacheKey(featureType, design) {
+            return `${CACHE_KEY_PREFIX}${featureType}${design ? `@${design}` : ''}`;
+        }
+        let stateDesign = null;
+        function syncDesignState(design) {
+            if (stateDesign === design) return;
+            if (stateDesign !== null) {
+                logger.debug(FEATURE_NAME, `design changed (${stateDesign || 'master'} -> ${design || 'master'}), resetting termination state`);
+                segmentBatchState.clear();
+                segmentOrientation.clear();
+                failedPins.clear();
+            }
+            stateDesign = design;
+            touchDesignCache(design);
+        }
+
+        // Keep caches for at most MAX_CACHED_DESIGNS designs (master doesn't count). The index
+        // records when each design was last opened; the least recently opened is evicted first.
+        const DESIGN_INDEX_KEY = 'qol-term-designs';
+        const MAX_CACHED_DESIGNS = 3;
+        const DESIGN_CACHE_MAX_AGE_DAYS = 2;
+        function touchDesignCache(design) {
+            if (!design) return;
+            try {
+                const index = JSON.parse(localStorage.getItem(DESIGN_INDEX_KEY) || '{}');
+                index[design] = Date.now();
+                const evict = Object.keys(index).sort((a, b) => index[b] - index[a]).slice(MAX_CACHED_DESIGNS);
+                evict.forEach((old) => {
+                    delete index[old];
+                    Object.keys(localStorage)
+                        .filter((k) => k.startsWith(CACHE_KEY_PREFIX) && k.endsWith(`@${old}`))
+                        .forEach((k) => localStorage.removeItem(k));
+                    logger.debug(FEATURE_NAME, `evicted cached terminations for ${old}`);
+                });
+                localStorage.setItem(DESIGN_INDEX_KEY, JSON.stringify(index));
+            } catch (error) {
+                logger.debug(FEATURE_NAME, 'Unable to update design cache index', error);
+            }
+        }
+
+        // Cleanup stale cache data (design caches expire sooner)
+        Object.keys(localStorage).forEach((k) => {
+            if (k.startsWith(CACHE_KEY_PREFIX)) {
+                purgeFeatureCache(k, k.includes('@design%2F') ? DESIGN_CACHE_MAX_AGE_DAYS : 5);
+            } else if (isLegacyTermCache(k)) {
+                localStorage.removeItem(k); // unprefixed cache from before the prefix; refilled on demand
             }
         });
 
-        function findSegmentAnchor(segment) {
-            // IDs contain slashes; use getElementById instead of querySelector
-            const candidates = [
-                `out_${segment}_anchor`,
-                `in_${segment}_anchor`,
-                `${segment}_anchor`
-            ];
-            for (const id of candidates) {
-                const el = document.getElementById(id);
-                if (el) return el;
+        // A pre-prefix cache: an object whose every entry is { saved: <time>, data }
+        function isLegacyTermCache(key) {
+            try {
+                const value = localStorage.getItem(key);
+                if (!value || !value.includes('"saved"')) return false;
+                const parsed = JSON.parse(value);
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+                const entries = Object.values(parsed);
+                return entries.length > 0 && entries.every((e) =>
+                    e && typeof e === 'object' && typeof e.saved === 'number' && Object.keys(e).length === 2 && 'data' in e);
+            } catch {
+                return false;
             }
-            return null;
+        }
+
+        // A segment can have several rows at once: a slack's A and Z rows are the in_ and out_ ends
+        // of the same segment. The slack row itself has the bare id and holds both, so the bare id
+        // is used only when there is no in_/out_ row. getElementById because IDs contain slashes.
+        function segmentElements(segment) {
+            const ends = [`out_${segment}`, `in_${segment}`]
+                .map((id) => document.getElementById(id))
+                .filter(Boolean);
+            if (ends.length) return ends;
+            const bare = document.getElementById(segment);
+            return bare ? [bare] : [];
+        }
+
+        function segmentRowAnchor(li) {
+            return document.getElementById(`${li.id}_anchor`) || li.querySelector(':scope > a.jstree-anchor');
+        }
+
+        function openSegmentElements(segment) {
+            return segmentElements(segment).filter((li) => segmentRowAnchor(li)?.getAttribute('aria-expanded') === 'true');
         }
 
         function isSegmentExpanded(segment) {
-            const anchor = findSegmentAnchor(segment);
-            return !!(anchor && anchor.getAttribute('aria-expanded') === 'true');
+            return openSegmentElements(segment).length > 0;
         }
 
         let renderSequence = 0;
+        const segmentOrientation = new Map(); // segment -> 'in' | 'out' (which strand side is shown first)
+
+        // ─── Segment-wide column layout ──────────────────────────────────────
+        // Each strand row becomes a 3-column grid:
+        //   lead (icon, pin, colours) | termination | tail (IQGeo's own splice/connection text)
+        // Column widths live in CSS variables on the segment <li>, so every row in the
+        // segment shares one left edge for the termination column and batches never
+        // have to measure individual rows. Widths only grow, never shrink.
+        (function injectTermLayoutStyles() {
+            if (document.getElementById('qol-term-layout-css')) return;
+            const style = document.createElement('style');
+            style.id = 'qol-term-layout-css';
+            style.textContent = `
+                a.jstree-anchor.qol-term-layout { display: inline-block; }
+                .qol-term-row {
+                    display: grid;
+                    grid-template-columns:
+                        var(--qol-term-lead, max-content)
+                        var(--qol-term-near, max-content)
+                        24px
+                        var(--qol-term-far, max-content)
+                        max-content;
+                    align-items: center;
+                    column-gap: 0;
+                    white-space: nowrap;
+                }
+                .qol-term-cell { display: flex; align-items: center; gap: 4px; align-self: stretch; }
+                .qol-term-lead { padding-right: 8px; }
+                .qol-term-tail { padding-left: 8px; }
+                /* Both ends sit on one shared band so they read as a single path */
+                .qol-term-has-path > .qol-term-near,
+                .qol-term-has-path > .qol-term-arrow,
+                .qol-term-has-path > .qol-term-far { background: #f5f7fa; }
+                .qol-term-has-path > .qol-term-near { padding: 0 2px 0 6px; border-radius: 4px 0 0 4px; }
+                .qol-term-has-path > .qol-term-far { padding: 0 6px 0 2px; border-radius: 0 4px 4px 0; }
+                .qol-term-colors {
+                    display: inline-flex; align-items: center; justify-content: flex-end; gap: 2px;
+                    min-width: var(--qol-term-colors, auto);
+                }
+                .qol-term-pin {
+                    display: inline-block; min-width: var(--qol-term-pin, auto);
+                    text-align: right; font-variant-numeric: tabular-nums;
+                }
+                .qol-term-arrow { justify-content: center; color: #2f3b4c; font-size: 15px; font-weight: 700; }
+                .qol-term-end { display: flex; align-items: center; gap: 5px; flex: 1 0 auto; font-size: 13px; cursor: pointer; }
+                .qol-term-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; box-sizing: border-box; }
+                .qol-term-dot.port { background: #1f8a5b; }
+                .qol-term-dot.open { border: 1.5px solid #c98a00; background: transparent; }
+                .qol-term-badge {
+                    flex: none; min-width: 30px; box-sizing: border-box; padding: 0 4px; border-radius: 3px;
+                    text-align: center; font-size: 10.5px; line-height: 15px; font-weight: 600; letter-spacing: 0.02em;
+                }
+                .qol-term-badge.eq { background: #e4eefb; color: #1d4f91; }
+                .qol-term-badge.st { background: #efeafb; color: #4b3b8f; }
+                .qol-term-label { display: flex; align-items: baseline; gap: 4px; flex: 0 0 auto; color: #222; }
+                .qol-term-name { max-width: 20ch; overflow: hidden; text-overflow: ellipsis; }
+                .qol-term-sub { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; color: #555; }
+                html.qol-term-hide-sub .qol-term-sub { display: none; }
+                /* Names that repeat the row above: softly faded (default), or run starts in semibold, or left as is */
+                html:not(.qol-term-repeats-bold):not(.qol-term-repeats-none) .qol-term-label.qol-term-repeat .qol-term-name { color: #5c5c5c; }
+                html:not(.qol-term-repeats-bold):not(.qol-term-repeats-none) .qol-term-label.qol-term-repeat .qol-term-sub { color: #7a7a7a; }
+                html.qol-term-repeats-bold .qol-term-label:not(.qol-term-repeat) .qol-term-name { font-weight: 600; }
+                .qol-term-num { margin-left: auto; padding-left: 6px; font-variant-numeric: tabular-nums; color: #444; }
+                .qol-term-failed { font-size: 12px; color: #a15c00; cursor: help; white-space: nowrap; }
+                /* IQGeo's own connection text: compact chip by default, full text optional */
+                .qol-term-splice {
+                    display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; line-height: 16px;
+                    font-size: 11px; color: #555; border: 1px solid #cfd4db; border-radius: 3px; cursor: help;
+                }
+                .qol-term-tail-full { display: none; align-items: center; gap: 4px; padding-left: 8px; border-left: 1px solid #cfd4db; }
+                html.qol-term-splice-full .qol-term-splice { display: none; }
+                html.qol-term-splice-full .qol-term-tail-full { display: inline-flex; }
+                .qol-term-legend { margin-left: 10px; font-size: 11px; color: #777; }
+                .qol-status-message { padding-left: 10px; font-size: 13px; }
+                .qol-term-clear-btn {
+                    margin-left: 6px; padding: 0 4px; font-size: 13px; line-height: 16px; cursor: pointer;
+                    background: transparent; color: #999; border: 1px solid transparent; border-radius: 3px;
+                }
+                .qol-term-clear-btn:hover { background: #c62828; color: #fff; }
+                /* Open cable and segment rows stay pinned while their children scroll underneath.
+                   The segment pins just below its cable (--qol-term-cable-h, set on each cable li), and a
+                   slack's A/Z row below the slack row too (--qol-term-seg-h, set on each open segment li).
+                   --qol-term-pad (set on the scroll container) cancels its top padding, which sticky
+                   would otherwise leave as a gap above the pinned rows. */
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > a.jstree-anchor,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] > a.jstree-anchor,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > i.jstree-ocl,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] > i.jstree-ocl {
+                    position: sticky; top: calc(0px - var(--qol-term-pad, 0px)); z-index: 3;
+                    background-color: var(--qol-term-sticky-bg, #fff);
+                }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] > i.jstree-ocl { z-index: 4; }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > a.jstree-anchor { z-index: 5; }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > i.jstree-ocl { z-index: 6; }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li[id*="fiber_cable/"] li.jstree-open[id*="mywcom_fiber_segment/"] > a.jstree-anchor,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li[id*="fiber_cable/"] li.jstree-open[id*="mywcom_fiber_segment/"] > i.jstree-ocl { top: calc(var(--qol-term-cable-h, 0px) - var(--qol-term-pad, 0px)); }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] li.jstree-open[id*="mywcom_fiber_segment/"] > a.jstree-anchor,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] li.jstree-open[id*="mywcom_fiber_segment/"] > i.jstree-ocl { top: calc(var(--qol-term-cable-h, 0px) + var(--qol-term-seg-h, 0px) - var(--qol-term-pad, 0px)); }
+                /* Hover and selection stay opaque: a tint layered over the solid row background */
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > a.jstree-anchor.jstree-hovered,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] > a.jstree-anchor.jstree-hovered {
+                    background-image: linear-gradient(rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.06));
+                }
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="fiber_cable/"] > a.jstree-anchor.jstree-clicked,
+                html.qol-term-sticky:not(.qol-term-sticky-off) li.jstree-open[id*="mywcom_fiber_segment/"] > a.jstree-anchor.jstree-clicked {
+                    background-image: linear-gradient(rgba(33, 113, 201, 0.16), rgba(33, 113, 201, 0.16));
+                }
+                /* While pinned: full-width backing (box-shadow adds no scroll area) and a divider */
+                html.qol-term-sticky:not(.qol-term-sticky-off) a.jstree-anchor.qol-seg-stuck {
+                    box-shadow: 0 0 0 100vmax var(--qol-term-sticky-bg, #fff), 0 1px 0 100vmax #cfd4db;
+                    clip-path: inset(0 -100vmax -1px -100vmax);
+                    cursor: pointer;
+                }
+                html.qol-term-sticky:not(.qol-term-sticky-off) a.jstree-anchor.qol-seg-stuck::after {
+                    content: "⤒"; margin-left: 8px; color: #2f3b4c; font-weight: 700;
+                }
+                .qol-term-legend .qol-term-dot { display: inline-block; margin: 0 3px 0 6px; vertical-align: middle; }
+            `;
+            (document.head || document.documentElement).appendChild(style);
+        })();
+
+        function isInsideToColors(node) {
+            return !!(node.closest && node.closest('.fiber-colors.to'));
+        }
+
+        // Split IQGeo's original strand label into the lead (icon, pin number, "from" colours)
+        // and the tail (connection/splice text and "to" colours). Falls back to "everything
+        // in the lead" when the label has no recognisable pin or colour block.
+        function splitBaseline(baselineHtml) {
+            const holder = document.createElement('div');
+            holder.innerHTML = baselineHtml;
+            const nodes = Array.from(holder.childNodes);
+            const lead = document.createDocumentFragment();
+            const tail = document.createDocumentFragment();
+
+            // First top-level node that is, or contains, a "from" colour block
+            let colorIdx = -1;
+            for (let i = 0; i < nodes.length; i++) {
+                const n = nodes[i];
+                if (n.nodeType !== Node.ELEMENT_NODE) continue;
+                if (n.matches('.fiber-colors.to')) break; // reached the far side of the connection
+                const isColor = n.matches('.fiber-colors, .fiberColorSymbol');
+                const inner = Array.from(n.querySelectorAll('.fiber-colors:not(.to), .fiberColorSymbol'))
+                    .find((c) => !isInsideToColors(c));
+                if (isColor || inner) { colorIdx = i; break; }
+            }
+
+            // First top-level text node that holds the pin number
+            let pinIdx = -1;
+            let pinEnd = 0;
+            for (let i = 0; i < nodes.length; i++) {
+                const n = nodes[i];
+                if (n.nodeType !== Node.TEXT_NODE) continue;
+                const m = n.nodeValue.match(/\d+/);
+                if (m) { pinIdx = i; pinEnd = m.index + m[0].length; break; }
+            }
+
+            if (pinIdx === -1 && colorIdx === -1) {
+                nodes.forEach((n) => lead.appendChild(n));
+                return { lead, tail };
+            }
+
+            // The lead ends at whichever comes later: the pin number or the "from" colours
+            const splitPinText = pinIdx > colorIdx;
+            const cutIdx = splitPinText ? pinIdx : colorIdx;
+            nodes.forEach((n, i) => {
+                if (i < cutIdx) {
+                    lead.appendChild(n);
+                } else if (i === cutIdx && splitPinText) {
+                    lead.appendChild(document.createTextNode(n.nodeValue.slice(0, pinEnd)));
+                    const rest = n.nodeValue.slice(pinEnd).replace(/^\s*-(?!>)\s*/, ' '); // drop a lone "-" separator, keep "->"
+                    if (rest.trim()) tail.appendChild(document.createTextNode(rest.trimStart()));
+                } else if (i === cutIdx) {
+                    lead.appendChild(n);
+                } else {
+                    tail.appendChild(n);
+                }
+            });
+
+            // Drop a tail that is only whitespace
+            const hasElements = Array.from(tail.childNodes).some((n) => n.nodeType === Node.ELEMENT_NODE);
+            if (!hasElements && !tail.textContent.trim()) {
+                return { lead, tail: document.createDocumentFragment() };
+            }
+            return { lead, tail };
+        }
+
+        // Convert one strand anchor into the grid row (idempotent). Returns the row.
+        function prepareStrandLayout(anchor, pin) {
+            const existing = anchor.querySelector(':scope > .qol-term-row');
+            if (existing) return existing;
+
+            ensureBaselineAnchor(anchor);
+            const { lead, tail } = splitBaseline(anchor.dataset.qolOriginalHtml || '');
+
+            const row = document.createElement('div');
+            row.classList.add('qol-term-row');
+            row.dataset.qolPin = pin;
+            const makeCell = (cls) => {
+                const c = document.createElement('div');
+                c.classList.add('qol-term-cell', cls);
+                return c;
+            };
+            const leadCell = makeCell('qol-term-lead');
+            const nearCell = makeCell('qol-term-near');
+            const arrowCell = makeCell('qol-term-arrow');
+            const farCell = makeCell('qol-term-far');
+            const tailCell = makeCell('qol-term-tail');
+            leadCell.appendChild(lead);
+            slotLead(leadCell);
+            if (tail.childNodes.length) {
+                // Text only, without the colour-badge abbreviations
+                const textOnly = document.createElement('div');
+                textOnly.appendChild(tail.cloneNode(true));
+                textOnly.querySelectorAll('.fiber-colors, .fiberColorSymbol').forEach((n) => n.remove());
+                const fullText = (textOnly.textContent || '').replace(/\s+/g, ' ').trim();
+                const pinRef = fullText.match(/#\s*[\w:-]+\s*$/);
+                const chip = document.createElement('span');
+                chip.className = 'qol-term-splice';
+                chip.textContent = `⇄ ${pinRef ? pinRef[0].replace(/\s+/g, '') : 'splice'}`;
+                chip.title = fullText;
+                const full = document.createElement('span');
+                full.className = 'qol-term-tail-full';
+                full.appendChild(tail);
+                tailCell.append(chip, full);
+            }
+            row.append(leadCell, nearCell, arrowCell, farCell, tailCell);
+
+            anchor.dataset.qolPin = pin;
+            anchor.replaceChildren(row);
+            anchor.classList.add('qol-term-layout');
+            return row;
+        }
+
+        // Grow a column variable on the segment <li> to fit its widest cell.
+        // All reads happen before the single write, so this is one layout pass.
+        // Width a cell needs: from its left edge to the end of its content, plus right padding.
+        // Sub-pixel accurate (scrollWidth rounds, which left some rows ~1px out of line).
+        function neededWidth(cell) {
+            if (!cell.childNodes.length) return 0;
+            // A Range measures text glyphs, which overflow:hidden doesn't clip, so an
+            // ellipsized name would report its full hidden width. Measure end cells by
+            // their element boxes instead (those respect max-width).
+            const end = cell.querySelector(':scope > .qol-term-end');
+            if (end) {
+                const kids = [...end.children];
+                const gap = parseFloat(getComputedStyle(end).columnGap) || 0;
+                const cs = getComputedStyle(cell);
+                return kids.reduce((w, k) => w + k.getBoundingClientRect().width, 0)
+                    + gap * Math.max(0, kids.length - 1)
+                    + (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+            }
+            const range = document.createRange();
+            range.selectNodeContents(cell);
+            const content = range.getBoundingClientRect();
+            if (!content.width && !content.height) return 0;
+            const box = cell.getBoundingClientRect();
+            return Math.max(box.width, content.right - box.left + (parseFloat(getComputedStyle(cell).paddingRight) || 0));
+        }
+
+        function growColumn(liElement, which) {
+            const varName = `--qol-term-${which}`;
+            const current = parseFloat(liElement.style.getPropertyValue(varName)) || 0;
+            let max = current;
+            liElement.querySelectorAll(`.qol-term-row .qol-term-${which}`).forEach((c) => {
+                max = Math.max(max, neededWidth(c));
+            });
+            if (max > current) {
+                liElement.style.setProperty(varName, `${Math.ceil(max)}px`);
+            }
+        }
+
+        // Display settings: { spliceText: 'compact' | 'full', secondary: true | false, stickyHeader: true | false,
+        //                     repeats: 'fade' | 'bold' | 'none' }
+        const TERM_DISPLAY_KEY = 'qol-term-display';
+        const TERM_DISPLAY_DEFAULTS = { spliceText: 'compact', secondary: true, stickyHeader: true, repeats: 'fade' };
+        function loadTermDisplay() {
+            try {
+                return { ...TERM_DISPLAY_DEFAULTS, ...JSON.parse(localStorage.getItem(TERM_DISPLAY_KEY) || '{}') };
+            } catch (e) {
+                return { ...TERM_DISPLAY_DEFAULTS };
+            }
+        }
+        function applyTermDisplay(settings) {
+            const root = document.documentElement;
+            root.classList.toggle('qol-term-splice-full', settings.spliceText === 'full');
+            root.classList.toggle('qol-term-hide-sub', settings.secondary === false);
+            root.classList.toggle('qol-term-sticky-off', settings.stickyHeader === false);
+            root.classList.toggle('qol-term-repeats-bold', settings.repeats === 'bold');
+            root.classList.toggle('qol-term-repeats-none', settings.repeats === 'none');
+        }
+        applyTermDisplay(loadTermDisplay());
+
+        // Column widths only grow, so a display change resets and re-measures every open segment
+        function remeasureAllSegments() {
+            document.querySelectorAll('li[style*="--qol-term"]').forEach((li) => {
+                TERM_COLUMN_VARS.forEach((v) => li.style.removeProperty(v));
+                ['colors', 'pin', 'lead', 'near', 'far'].forEach((which) => growColumn(li, which));
+            });
+        }
+
+        // ─── Pinned segment row ──────────────────────────────────────────────
+        // CSS keeps the open segment's row (and its expand/collapse arrow) pinned while its
+        // strands scroll. While pinned, a click on the row jumps back to the segment instead
+        // of selecting it (which would change the current feature and refresh the trees).
+        const STICKY_ROW_LIS = ['li.jstree-open[id*="fiber_cable/"]', 'li.jstree-open[id*="mywcom_fiber_segment/"]'];
+        const STICKY_LI_SELECTOR = STICKY_ROW_LIS.join(', ');
+        const STICKY_ANCHOR_SELECTOR = STICKY_ROW_LIS.map((sel) => `${sel} > a.jstree-anchor`).join(', ');
+        const STICKY_OCL_SELECTOR = STICKY_ROW_LIS.map((sel) => `${sel} > i.jstree-ocl`).join(', ');
+        const scrollContainerCache = new WeakMap();
+        let stickyActive = false;
+        let stickyRaf = 0;
+        let stickyWarned = false;
+        const stickyPaddedContainers = new Set();
+
+        function findScrollContainer(el) {
+            const cached = scrollContainerCache.get(el);
+            if (cached && cached.isConnected && cached.contains(el)) return cached;
+            let found = document.scrollingElement || document.documentElement;
+            for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+                const oy = getComputedStyle(n).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) { found = n; break; }
+            }
+            scrollContainerCache.set(el, found);
+            return found;
+        }
+
+        function isPageScroller(container) {
+            return container === document.scrollingElement || container === document.documentElement;
+        }
+
+        function containerTop(container) {
+            return isPageScroller(container) ? 0 : container.getBoundingClientRect().top;
+        }
+
+        // Top of the scrollport (inside the border), where pinned rows sit once the padding is cancelled
+        function scrollportTop(container) {
+            return isPageScroller(container) ? 0 : container.getBoundingClientRect().top + container.clientTop;
+        }
+
+        function effectiveBackground(el) {
+            for (let n = el; n; n = n.parentElement) {
+                const bg = getComputedStyle(n).backgroundColor;
+                if (bg && bg !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(bg)) return bg;
+            }
+            return '#fff';
+        }
+
+        function scrollToSegment(li, container = findScrollContainer(li), behavior = 'smooth') {
+            const anchor = li.querySelector(':scope > a.jstree-anchor');
+            const pinnedTop = anchor ? parseFloat(getComputedStyle(anchor).top) || 0 : 0;
+            const pad = isPageScroller(container) ? 0 : parseFloat(getComputedStyle(container).paddingTop) || 0;
+            const delta = li.getBoundingClientRect().top - scrollportTop(container) - pad - pinnedTop;
+            if (Math.abs(delta) > 1) container.scrollBy({ top: delta, behavior });
+        }
+
+        function setStuck(anchor, stuck) {
+            if (stuck === anchor.classList.contains('qol-seg-stuck')) return;
+            anchor.classList.toggle('qol-seg-stuck', stuck);
+            if (stuck) {
+                anchor.dataset.qolPrevTitle = anchor.getAttribute('title') || '';
+                const kind = anchor.parentElement?.id?.includes('fiber_cable/') ? 'cable' : 'segment';
+                anchor.setAttribute('title', `Jump back to this ${kind}`);
+            } else {
+                if (anchor.dataset.qolPrevTitle) anchor.setAttribute('title', anchor.dataset.qolPrevTitle);
+                else anchor.removeAttribute('title');
+                delete anchor.dataset.qolPrevTitle;
+            }
+        }
+
+        // Explain once if an ancestor's overflow setting stops sticky from working
+        function warnIfStickyBlocked(li, anchor, liTop, anchorTop) {
+            if (stickyWarned) return;
+            const container = findScrollContainer(li);
+            const cTop = containerTop(container);
+            if (!(liTop < cTop - 4 && anchorTop < cTop - 4 && li.getBoundingClientRect().bottom > cTop + 48)) return;
+            stickyWarned = true;
+            let blocker = null;
+            for (let n = li.parentElement; n && n !== container; n = n.parentElement) {
+                const cs = getComputedStyle(n);
+                if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') { blocker = n; break; }
+            }
+            logger.warn(FEATURE_NAME, 'Segment row did not stay pinned; an ancestor with overflow set is likely blocking position: sticky', { blocker, container });
+        }
+
+        function updateStuckState() {
+            stickyRaf = 0;
+            const root = document.documentElement;
+            const anchors = [...document.querySelectorAll(STICKY_ANCHOR_SELECTOR)];
+            if (anchors.length && !root.style.getPropertyValue('--qol-term-sticky-bg')) {
+                root.style.setProperty('--qol-term-sticky-bg', effectiveBackground(anchors[0].parentElement));
+            }
+            for (const c of stickyPaddedContainers) if (!c.isConnected) stickyPaddedContainers.delete(c);
+
+            // Read everything first, then write, so the frame does one layout instead of one per row.
+            // Rows are measured per tree: a hidden tree (e.g. the Cables tab behind a dialog) has 0-height rows.
+            const pads = new Map();
+            const rows = anchors.map((anchor) => {
+                const li = anchor.parentElement;
+                const container = findScrollContainer(li);
+                if (!isPageScroller(container) && !pads.has(container)) {
+                    pads.set(container, `${parseFloat(getComputedStyle(container).paddingTop) || 0}px`);
+                }
+                const anchorRect = anchor.getBoundingClientRect();
+                return { anchor, li, height: anchorRect.height, liTop: li.getBoundingClientRect().top, anchorTop: anchorRect.top };
+            });
+
+            pads.forEach((pad, container) => {
+                if (container.style.getPropertyValue('--qol-term-pad') === pad) return;
+                container.style.setProperty('--qol-term-pad', pad);
+                stickyPaddedContainers.add(container);
+            });
+            rows.forEach(({ li, height }) => {
+                if (!height) return;
+                const prop = li.id.includes('fiber_cable/') ? '--qol-term-cable-h' : '--qol-term-seg-h';
+                const h = `${Math.round(height)}px`;
+                if (li.style.getPropertyValue(prop) !== h) li.style.setProperty(prop, h);
+            });
+            rows.forEach(({ anchor, li, liTop, anchorTop }) => {
+                const stuck = anchorTop - liTop > 1;
+                setStuck(anchor, stuck);
+                if (!stuck) warnIfStickyBlocked(li, anchor, liTop, anchorTop);
+            });
+            // Rows that are no longer open segments lose the pinned state
+            document.querySelectorAll('a.jstree-anchor.qol-seg-stuck').forEach((a) => {
+                if (!a.parentElement?.matches(STICKY_LI_SELECTOR)) setStuck(a, false);
+            });
+        }
+
+        function onStickyScroll() {
+            if (!stickyRaf) stickyRaf = requestAnimationFrame(updateStuckState);
+        }
+
+        // Capture phase on document runs before jstree's and IQGeo's own click handlers
+        function onStickyClick(e) {
+            if (document.documentElement.classList.contains('qol-term-sticky-off')) return;
+            const target = e.target instanceof Element ? e.target : null;
+            if (!target) return;
+
+            // Collapse arrow pressed while pinned: let jstree collapse, then bring the segment back into view
+            const ocl = target.closest(STICKY_OCL_SELECTOR);
+            if (ocl) {
+                const li = ocl.parentElement;
+                const anchor = li.querySelector(':scope > a.jstree-anchor');
+                if (e.type === 'click' && anchor?.classList.contains('qol-seg-stuck')) {
+                    const container = findScrollContainer(li);
+                    requestAnimationFrame(() => requestAnimationFrame(() => scrollToSegment(li, container, 'auto')));
+                }
+                return;
+            }
+
+            const anchor = target.closest(STICKY_ANCHOR_SELECTOR);
+            if (!anchor || target.closest('.qol-term-clear-btn')) return;
+            const recentlyJumped = Date.now() - (Number(anchor.dataset.qolJumpedAt) || 0) < 700;
+            if (!anchor.classList.contains('qol-seg-stuck') && !recentlyJumped) return;
+
+            // Swallow the click (and a double-click's second half) so the current feature doesn't change
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            if (e.type === 'click' && !recentlyJumped) {
+                anchor.dataset.qolJumpedAt = String(Date.now());
+                scrollToSegment(anchor.parentElement);
+            }
+        }
+
+        function enableStickyHeaders() {
+            if (stickyActive) return;
+            stickyActive = true;
+            document.documentElement.classList.add('qol-term-sticky');
+            document.documentElement.style.removeProperty('--qol-term-sticky-bg'); // re-read the tree background
+            document.addEventListener('scroll', onStickyScroll, { capture: true, passive: true });
+            document.addEventListener('click', onStickyClick, true);
+            document.addEventListener('dblclick', onStickyClick, true);
+            onStickyScroll();
+        }
+
+        function disableStickyHeaders() {
+            if (!stickyActive) return;
+            stickyActive = false;
+            document.documentElement.classList.remove('qol-term-sticky');
+            document.removeEventListener('scroll', onStickyScroll, { capture: true });
+            document.removeEventListener('click', onStickyClick, true);
+            document.removeEventListener('dblclick', onStickyClick, true);
+            if (stickyRaf) cancelAnimationFrame(stickyRaf);
+            stickyRaf = 0;
+            document.querySelectorAll('a.jstree-anchor.qol-seg-stuck').forEach((a) => setStuck(a, false));
+            document.querySelectorAll('li[style*="--qol-term-cable-h"], li[style*="--qol-term-seg-h"]').forEach((li) => {
+                li.style.removeProperty('--qol-term-cable-h');
+                li.style.removeProperty('--qol-term-seg-h');
+            });
+            stickyPaddedContainers.forEach((c) => c.style.removeProperty('--qol-term-pad'));
+            stickyPaddedContainers.clear();
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
+        const TERM_COLUMN_VARS = ['--qol-term-lead', '--qol-term-colors', '--qol-term-pin', '--qol-term-near', '--qol-term-far'];
+
+        // After a batch: mark run starts, then grow the end columns (semibold is wider), once per frame
+        const pendingRefresh = new Set();
+        function scheduleRefresh(liElement) {
+            const key = liElement.id;
+            if (pendingRefresh.has(key)) return;
+            pendingRefresh.add(key);
+            requestAnimationFrame(() => {
+                pendingRefresh.delete(key);
+                if (!liElement.isConnected) return;
+                muteRepeats(liElement);
+                growColumn(liElement, 'near');
+                growColumn(liElement, 'far');
+            });
+        }
+
+        // Put the colour badges and the strand number in their own slots so both line up
+        // across rows (tube badges such as "VT/BK" are wider than "BL").
+        function slotLead(leadCell) {
+            const colorSlot = document.createElement('span');
+            colorSlot.className = 'qol-term-colors';
+            const pinSlot = document.createElement('span');
+            pinSlot.className = 'qol-term-pin';
+            Array.from(leadCell.childNodes).forEach((n) => {
+                if (n.nodeType === Node.ELEMENT_NODE &&
+                    (n.matches('.fiber-colors, .fiberColorSymbol') || n.querySelector('.fiber-colors, .fiberColorSymbol'))) {
+                    colorSlot.appendChild(n);
+                } else if (n.nodeType === Node.TEXT_NODE && /\d/.test(n.nodeValue) && !pinSlot.textContent) {
+                    pinSlot.textContent = n.nodeValue.trim();
+                    n.remove();
+                } else if (n.nodeType === Node.TEXT_NODE && !n.nodeValue.trim()) {
+                    n.remove();
+                }
+            });
+            if (!colorSlot.childNodes.length && !pinSlot.textContent) return; // unrecognised label: leave as-is
+            leadCell.append(colorSlot, pinSlot);
+        }
+
+        const EQUIPMENT_BADGES = {
+            fiber_patch_panel: 'PNL', fiber_ont: 'ONT', fiber_splitter: 'SPL', fiber_mst: 'MST', shelf: 'SHF',
+            fiber_sfp: 'SFP', card: 'CRD', fiber_demux: 'DMX', cub_cpe: 'CPE'
+        };
+        const STRUCTURE_BADGES = {
+            building: 'BLDG', manhole: 'MH', migration_structure: 'MS', mywcom_route_junction: 'JCT',
+            cabinet: 'CAB', pole: 'POLE', mid_span: 'MSP', splice_closure: 'SC'
+        };
+        // UUB (manhole feature) badges by its type; anything else is treated as a manhole
+        const UUB_TYPE_BADGES = { Manhole: 'MH', Handhole: 'HH', Pedestal: 'PED' };
+        const uubBadge = (type) => UUB_TYPE_BADGES[type] || 'MH';
+        // IQGeo appends the pin spec to desc ("<name>#IN:3", "<cable>#1"); the number is shown
+        // separately, so drop only that suffix and keep any '#' inside the name itself
+        const stripPinSuffix = (desc) => (desc || '').replace(/(?<=\S)#(?:(?:IN|OUT):)?\d+$/i, '').trim();
+        const shortType = (type) => (type || '?').replace(/^(fiber_|mywcom_)/, '').slice(0, 4).toUpperCase();
+        const cleanTitle = (title) => (title || '').replace(/^[^:]{1,40}:\s+/, '').replace(/Splice Closure/, 'Closure').trim();
+
+        // Customer-end equipment is known by the building it's in, not by its own id
+        const BUILDING_LABEL_TYPES = new Set(['fiber_mst', 'fiber_sfp', FIBER_ONT, 'cub_cpe']);
+        const buildingAddress = (h) => [h?.street_num, h?.street].filter(Boolean).join(' ').trim();
+        // { name, address } of the building housing this end, or null when it isn't in a building
+        function endBuilding(side) {
+            const type = (side.feature || '').split('/')[0];
+            if (!BUILDING_LABEL_TYPES.has(type) || !String(side.equipmentInfo?.root_housing || '').startsWith('building/')) return null;
+            const h = side.housingInfo;
+            const building = { name: h?.cust_name || h?.name || '', address: buildingAddress(h) };
+            return building.name || building.address ? building : null;
+        }
+
+        // Break one end into display parts: badge, primary name, secondary text, number, open/terminated
+        function describeEnd(side) {
+            const [type, id] = (side.feature || '').split('/');
+            const desc = stripPinSuffix(side.desc);
+
+            if (side.type === PORT) {
+                const h = side.housingInfo;
+                const eq = side.equipmentInfo;
+                const building = endBuilding(side);
+                if (building) {
+                    // Name and address; with no name the address leads and the id follows
+                    return {
+                        kind: 'eq',
+                        badge: EQUIPMENT_BADGES[type] || shortType(type),
+                        primary: building.name || building.address,
+                        secondary: building.name ? building.address : id,
+                        num: `P${side.pin}`,
+                        open: false
+                    };
+                }
+                let housing = '';
+                let ident = eq?.name || id;
+                if (type === FIBER_PATCH_PANEL) {
+                    housing = h?.name || h?.description;
+                    ident = id; // users know panels by id
+                } else if (type === FIBER_ONT) {
+                    housing = h?.cust_name || h?.name || h?.description;
+                    ident = id;
+                } else if (type === 'shelf') {
+                    housing = h?.description;
+                    ident = id;
+                } else if (type === 'fiber_splitter') {
+                    ident = eq?.device_id || side.title?.replace(/^Splitter: /, '') || id;
+                } else if (type === 'fiber_mst') {
+                    ident = id;
+                }
+                return {
+                    kind: 'eq',
+                    badge: EQUIPMENT_BADGES[type] || shortType(type),
+                    primary: housing || ident || '',
+                    secondary: housing ? (ident || '') : '',
+                    num: `P${side.pin}`,
+                    open: false
+                };
+            }
+
+            // Cable end: the strand stops unterminated at a structure
+            const sd = side.structureData;
+            const est = sd?.end_structure_type;
+            let badge = STRUCTURE_BADGES[est] || (est ? shortType(est) : 'END');
+            if (est === 'manhole') badge = uubBadge(side.endStructureData?.type);
+            let place = cleanTitle(sd?.end_structure_title);
+            if (est === 'building') {
+                place = side.endStructureData?.cust_name || side.endStructureData?.name || place;
+            }
+            return {
+                kind: 'st',
+                badge,
+                primary: place || desc,
+                secondary: place ? desc : '',
+                num: `S${side.pin}`,
+                open: true
+            };
+        }
+
+        // Build one end cell. The old one-line label (formatText) becomes the hover text and
+        // keeps its click-to-select behaviour.
+        function buildEndCell(side) {
+            const legacy = formatText(side);
+            const parts = describeEnd(side);
+
+            const end = document.createElement('span');
+            end.className = 'qol-term-end';
+            end.dataset.qolKey = `${parts.badge}|${parts.primary}|${parts.secondary}`;
+            end.title = [legacy.textContent, legacy.title].filter(Boolean).join('\n');
+            end.addEventListener('click', () => legacy.click());
+
+            const dot = document.createElement('span');
+            dot.className = `qol-term-dot ${parts.open ? 'open' : 'port'}`;
+
+            const badge = document.createElement('span');
+            badge.className = `qol-term-badge ${parts.kind}`;
+            badge.textContent = parts.badge;
+
+            const label = document.createElement('span');
+            label.className = 'qol-term-label';
+            const name = document.createElement('span');
+            name.className = 'qol-term-name';
+            name.textContent = parts.primary;
+            label.appendChild(name);
+            if (parts.secondary) {
+                const sub = document.createElement('span');
+                sub.className = 'qol-term-sub';
+                sub.textContent = `· ${parts.secondary}`;
+                label.appendChild(sub);
+            }
+
+            const num = document.createElement('span');
+            num.className = 'qol-term-num';
+            num.textContent = parts.num;
+
+            end.append(dot, badge, label, num);
+            return end;
+        }
+
+        // Mark an end's name as a repeat when it matches the same end on the row above (run starts stay semibold)
+        function muteRepeats(liElement) {
+            const rows = Array.from(liElement.querySelectorAll('.qol-term-row'))
+                .sort((a, b) => Number(a.dataset.qolPin) - Number(b.dataset.qolPin));
+            ['near', 'far'].forEach((which) => {
+                let previousKey = null;
+                rows.forEach((row) => {
+                    const end = row.querySelector(`.qol-term-${which} .qol-term-end`);
+                    const key = end ? end.dataset.qolKey : null;
+                    const label = end?.querySelector('.qol-term-label');
+                    if (label) label.classList.toggle('qol-term-repeat', !!key && key === previousKey);
+                    previousKey = key;
+                });
+            });
+        }
+
+        // Convert every strand row in the segment up front, then size the lead column once.
+        // Strand rows exist as soon as the segment opens, so this does not depend on batches.
+        function prepareSegmentLayout(liElement, strandAnchorIndex) {
+            let created = false;
+            Object.entries(strandAnchorIndex).forEach(([pin, a]) => {
+                if (!a.querySelector(':scope > .qol-term-row')) {
+                    prepareStrandLayout(a, pin);
+                    created = true;
+                }
+            });
+            if (created) {
+                growColumn(liElement, 'colors');
+                growColumn(liElement, 'pin');
+                growColumn(liElement, 'lead');
+            }
+        }
+
+        // Best-effort layout pass as soon as a segment opens, before any data arrives
+        function prepareSegment(segment) {
+            openSegmentElements(segment).forEach((liElement) => {
+                const index = indexStrandAnchors(liElement);
+                if (Object.keys(index).length) prepareSegmentLayout(liElement, index);
+            });
+        }
+
+        // Decide which side goes first from every strand known for the segment, not per batch
+        function decideOrientation(segment, fallbackStrands) {
+            const known = (segmentBatchState.get(segment)?.strands || []).filter(Boolean);
+            const pool = known.length ? known : fallbackStrands;
+            let inCount = 0, outCount = 0;
+            pool.forEach((strand) => {
+                if (strand.in?.feature?.startsWith(FIBER_PATCH_PANEL)) inCount++;
+                if (strand.out?.feature?.startsWith(FIBER_PATCH_PANEL)) outCount++;
+            });
+            return inCount > outCount ? 'in' : 'out';
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         function indexStrandAnchors(liElement) {
             // Map strand pin -> anchor element (tolerant of injected rows)
@@ -2522,6 +3313,8 @@
             if (!leafAnchors.length) return anchors;
 
             const extractTextPin = (node) => {
+                // Rows already converted to the grid carry their pin
+                if (node.dataset.qolPin) return parseInt(node.dataset.qolPin, 10);
                 const clone = node.cloneNode(true);
                 clone.querySelectorAll('.qol-term-row, .qol-status-message').forEach((n) => n.remove());
                 const text = (clone.textContent || '').trim();
@@ -2535,7 +3328,7 @@
                     anchors[pin] = a;
                 }
             });
-            
+
             logger.debug(FEATURE_NAME, 'indexStrandAnchors', {
                 li: liElement?.id,
                 leafAnchors: leafAnchors.length,
@@ -2557,7 +3350,8 @@
             if (!anchor) return;
             // Restore from baseline (don't re-capture, that would overwrite with modified state)
             anchor.innerHTML = anchor.dataset.qolOriginalHtml || '';
-            anchor.classList.remove('qol-term');
+            anchor.classList.remove('qol-term', 'qol-term-layout');
+            delete anchor.dataset.qolPin;
             anchor.querySelectorAll('.qol-status-message').forEach((n) => n.remove());
         }
 
@@ -2565,14 +3359,16 @@
             if (!liElement) return;
             liElement.querySelectorAll('li.jstree-leaf > a').forEach(resetStrandAnchor);
             liElement.querySelectorAll('.qol-status-message').forEach((n) => n.remove());
+            TERM_COLUMN_VARS.forEach((v) => liElement.style.removeProperty(v));
         }
 
-        async function showTerminations(segment, strands) {
+        // forceRefresh: re-fetch end details instead of reading the cache (only for this call)
+        async function showTerminations(segment, strands, { forceRefresh = false } = {}) {
             // Don't render if feature is disabled
             if (!featureManager.isEnabled("Auto Terminations")) {
                 return;
             }
-            
+
             const seq = ++renderSequence;
             logger.log(FEATURE_NAME, 'showTerminations seq', seq, 'segment:', segment, 'strands len:', strands?.length);
             try {
@@ -2580,131 +3376,142 @@
                     logger.error(FEATURE_NAME, "Invalid data: strands is not an array", strands);
                     return;
                 }
-                
+
                 // Filter out undefined/null values from sparse array
                 const validStrands = strands.filter(Boolean);
                 if (!validStrands.length) {
                     logger.debug(FEATURE_NAME, "No valid strands to display for segment:", segment);
                     return;
                 }
-                
-                const anchor = findSegmentAnchor(segment);
-                if (!anchor || anchor.getAttribute('aria-expanded') !== 'true') {
+
+                const openLis = openSegmentElements(segment);
+                if (!openLis.length) {
                     return;
                 }
-                const liElement = document.getElementById(`out_${segment}`) || document.getElementById(`in_${segment}`) || document.getElementById(segment);
-                if (!liElement) {
-                    const count = displayRetryCounts.get(segment) || 0;
-                    if (count < 5) {
-                        displayRetryCounts.set(segment, count + 1);
-                        setTimeout(() => showTerminations(segment, strands), 250 * (count + 1));
-                    }
-                    return;
-                }
-                displayRetryCounts.delete(segment);
-                const strandAnchorIndex = indexStrandAnchors(liElement);
-                if (!Object.keys(strandAnchorIndex).length) {
+                // Every open row of the segment (both ends of a slack) gets the same terminations
+                const targets = openLis
+                    .map((liElement) => ({ liElement, strandAnchorIndex: indexStrandAnchors(liElement) }))
+                    .filter((t) => Object.keys(t.strandAnchorIndex).length);
+                if (!targets.length) {
                     const key = `${segment}::anchors`;
                     const count = displayRetryCounts.get(key) || 0;
                     if (count < 5) {
                         displayRetryCounts.set(key, count + 1);
-                        setTimeout(() => showTerminations(segment, strands), 250 * (count + 1));
+                        setTimeout(() => showTerminations(segment, strands, { forceRefresh }), 250 * (count + 1));
                         logger.debug(FEATURE_NAME, 'anchors not ready, retry', { segment, attempt: count + 1 });
                     } else {
-                        logger.error(FEATURE_NAME, 'Strand DOM elements not found after retries:', segment);
+                        // Usually the tree was rebuilt for another feature mid-render, so not an error
+                        logger.debug(FEATURE_NAME, 'Strand DOM elements not found after retries:', segment);
                         displayRetryCounts.delete(key); // Clean up
                     }
                     return;
                 }
                 displayRetryCounts.delete(`${segment}::anchors`);
-                // Reset only pins we are about to render; avoid clearing unrelated pins during batch updates
-                let inCount = 0, outCount = 0;
-                validStrands.forEach((strand) => {
-                    if (strand.in.feature.startsWith(FIBER_PATCH_PANEL)) inCount++;
-                    if (strand.out.feature.startsWith(FIBER_PATCH_PANEL)) outCount++;
-                });
-                for (const strand of validStrands) {
+
+                // Every strand row gets the grid (and the lead column its width) before any cell is filled
+                targets.forEach((t) => prepareSegmentLayout(t.liElement, t.strandAnchorIndex));
+
+                // Orientation is per segment; if a new batch changes it, re-render everything known
+                const orientation = decideOrientation(segment, validStrands);
+                const previousOrientation = segmentOrientation.get(segment);
+                segmentOrientation.set(segment, orientation);
+                let renderList = validStrands;
+                if (previousOrientation && previousOrientation !== orientation) {
+                    const known = (segmentBatchState.get(segment)?.strands || []).filter(Boolean);
+                    if (known.length) renderList = known;
+                    logger.debug(FEATURE_NAME, 'orientation changed, re-rendering segment', { segment, previousOrientation, orientation });
+                }
+
+                for (const strand of renderList) {
                     const pin = parseInt(strand.pin, 10);
-                    const strandElement = strandAnchorIndex[pin];
-                    if (!strandElement) {
+                    const strandElements = targets.map((t) => t.strandAnchorIndex[pin]).filter(Boolean);
+                    if (!strandElements.length) {
                         logger.warn(FEATURE_NAME, `no strand anchor for pin ${pin} in ${segment}`, {
                             seq,
-                            pinsAvailable: Object.keys(strandAnchorIndex),
+                            pinsAvailable: Object.keys(targets[0].strandAnchorIndex),
                             strand
                         });
                         continue;
                     }
-                    ensureBaselineAnchor(strandElement);
-                    strandElement.querySelectorAll('.qol-term-row').forEach((n) => n.remove());
-                    const baselineHtml = strandElement.dataset.qolOriginalHtml || '';
-                    // Render baseline temporarily to measure width, then clear to avoid duplicate baseline rows
-                    strandElement.innerHTML = baselineHtml;
-                    const cell1Width = Math.max(strandElement.getBoundingClientRect?.().width || 0, strandElement.clientWidth || 0, 100);
-                    strandElement.innerHTML = '';
-                    strandElement.querySelectorAll('.qol-status-message').forEach((el) => el.remove());
-                    strandElement.classList.remove('qol-term');
-                    let inSide, outSide;
-                    if (inCount > outCount) {
-                        [inSide, outSide] = [strand.in, strand.out];
-                    } else {
-                        [inSide, outSide] = [strand.out, strand.in];
-                    }
-                    const [popIn, popOut] = await Promise.all([populateSideInfo(inSide), populateSideInfo(outSide)]);
-                    const inElement = formatText(popIn);
-                    const outElement = formatText(popOut);
-                    const openingP = document.createTextNode(' (');
-                    const closingP = document.createTextNode(')');
-                    const arrowElement = document.createElement('span');
-                    arrowElement.textContent = ' ➡ ';
-                    
-                    const wrappedElement = document.createElement('span');
-                    wrappedElement.append(openingP, inElement, arrowElement, outElement, closingP);
+                    // One bad end must not stop the rest of the batch from rendering
+                    try {
+                        const [nearSide, farSide] = orientation === 'in' ? [strand.in, strand.out] : [strand.out, strand.in];
+                        const [popNear, popFar] = await Promise.all([populateSideInfo(nearSide, forceRefresh), populateSideInfo(farSide, forceRefresh)]);
 
-                    const row = document.createElement('div');
-                    row.classList.add('qol-term-row');
-                    row.style.display = 'flex';
-                    row.style.justifyContent = 'space-between';
-                    row.dataset.qolPin = pin;
-                    const cell1 = document.createElement('div');
-                    cell1.classList.add('qol-term-cell', 'qol-term-cell1');
-                    cell1.style.width = `${cell1Width + 5}px`;
-                    cell1.innerHTML = baselineHtml;
-                    const iconElement = cell1.querySelector('.jstree-icon');
-                    if (iconElement && iconElement.style.backgroundImage.includes('features/fiber.svg')) {
-                        iconElement.style.backgroundImage = `url("${determineIcon(inSide.type, outSide.type)}")`;
-                    }
-                    row.appendChild(cell1);
-                    const cell2 = document.createElement('div');
-                    cell2.classList.add('qol-term-cell', 'qol-term-cell2');
-                    cell2.appendChild(wrappedElement);
-                    row.appendChild(cell2);
-                    strandElement.appendChild(row);
-                    strandElement.classList.add('qol-term');
-                    const dupCells = strandElement.querySelectorAll('.qol-term-cell2').length;
-                    if (dupCells > 1) {
-                        logger.debug(FEATURE_NAME, 'multiple term cells after inject', { segment, pin, dupCells, seq });
+                        for (const strandElement of strandElements) {
+                            const row = prepareStrandLayout(strandElement, pin);
+                            row.querySelector('.qol-term-near').replaceChildren(buildEndCell(popNear));
+                            row.querySelector('.qol-term-arrow').textContent = '➜';
+                            row.querySelector('.qol-term-far').replaceChildren(buildEndCell(popFar));
+                            row.classList.add('qol-term-has-path');
+
+                            // Swap the generic fiber icon for one that reflects both end types
+                            const iconElement = row.querySelector('.qol-term-lead .jstree-icon');
+                            if (iconElement) {
+                                if (iconElement.dataset.qolOrigIcon === undefined) {
+                                    iconElement.dataset.qolOrigIcon = iconElement.style.backgroundImage || '';
+                                }
+                                if (iconElement.dataset.qolOrigIcon.includes('features/fiber.svg')) {
+                                    iconElement.style.backgroundImage = `url("${determineIcon(nearSide.type, farSide.type)}")`;
+                                }
+                            }
+                            strandElement.classList.add('qol-term');
+                        }
+                    } catch (strandError) {
+                        logger.warn(FEATURE_NAME, `Unable to render termination for pin ${pin} in ${segment}`, strandError);
                     }
                 }
+
+                // End columns grow to fit this batch; only the trailing splice text moves
+                targets.forEach((t) => scheduleRefresh(t.liElement));
             } catch (error) {
                 logger.error(FEATURE_NAME, `Unable to show terminations for ${segment}`, error);
             }
         }
-        
+
+        // IQGeo rebuilds the tree after its own trace, so rows drawn before that lose their labels.
+        // Draw the known strands (and failure markers) again on rows that don't have them.
+        function renderMissingRows(segment) {
+            ensurePendingStatus(segment);
+            const strands = (segmentBatchState.get(segment)?.strands || []).filter(Boolean);
+            const failed = failedPins.get(segment);
+            const indexes = openSegmentElements(segment).map((li) => indexStrandAnchors(li));
+            const isMissing = (pin, selector) => indexes.some((index) => index[pin] && !index[pin].querySelector(selector));
+            const missing = strands.filter((strand) => {
+                const pin = parseInt(strand.pin, 10);
+                return !failed?.has(pin) && isMissing(pin, '.qol-term-has-path');
+            });
+            failed?.forEach((reason, pin) => { if (isMissing(pin, '.qol-term-failed')) showFailedStrand(segment, pin, reason); });
+            if (!missing.length) return null;
+            logger.debug(FEATURE_NAME, `redrawing ${missing.length} rows the tree rebuilt`, segment);
+            return showTerminations(segment, missing);
+        }
+
+        // A rebuilt segment row also loses its "Updating Terminations..." status mid-load
+        function ensurePendingStatus(segment) {
+            openSegmentElements(segment).forEach((li) => {
+                if (!segmentRowAnchor(li)?.querySelector('.qol-status-message')) showStatusOnRow(segment, li, PENDING_STATUS, '');
+            });
+        }
+
+        const PENDING_STATUS = '⟳ Updating…';
+
+        // "✓ 3:45 PM" for a load today, "✓ Nov 10" for an older one; the full time goes in the hover text
+        function shortSavedTime(date) {
+            const today = date.toDateString() === new Date().toDateString();
+            return today
+                ? date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+                : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        }
+
+        // Status shows on every open row of the segment; closed rows are skipped
         function displayStatusMessage(segment, message, savedTimestamp = '') {
-            // Only show status when the segment anchor is open
-            if (!isSegmentExpanded(segment)) {
-                return;
-            }
+            openSegmentElements(segment).forEach((liElement) => showStatusOnRow(segment, liElement, message, savedTimestamp));
+        }
 
-            const liElement = document.getElementById(`out_${segment}`) || document.getElementById(`in_${segment}`) || document.getElementById(segment);
-            if (!liElement) {
-                // Tree/segment not in DOM yet; skip status update quietly
-                return;
-            }
-
+        function showStatusOnRow(segment, liElement, message, savedTimestamp) {
             try {
-                // Prefer the segment anchor; fall back to any anchor inside the li
-                const anchor = findSegmentAnchor(segment) || liElement.querySelector('a');
+                const anchor = segmentRowAnchor(liElement);
                 if (!anchor) {
                     return;
                 }
@@ -2714,11 +3521,9 @@
                 if (!statusElement) {
                     statusElement = document.createElement('span');
                     statusElement.classList.add('qol-status-message');
-                    statusElement.style.paddingLeft = '10px';
-                    statusElement.style.color = iqgeoGreen;
-                    statusElement.style.fontSize = '13px';
                     anchor.appendChild(statusElement);
                 }
+                statusElement.style.color = iqgeoGreen; // Clear greys it
 
                 // Remove existing clear button if any
                 const existingClearBtn = anchor.querySelector('.qol-term-clear-btn');
@@ -2729,51 +3534,56 @@
                 // Set the message to indicate the current status
                 if (savedTimestamp) {
                     const savedDate = new Date(savedTimestamp);
-                    statusElement.textContent = `(Terminations updated: ${savedDate.toLocaleString()})`;
-                    
+                    statusElement.textContent = `✓ ${shortSavedTime(savedDate)}`;
+                    statusElement.title = `Terminations updated: ${savedDate.toLocaleString()}`;
+
                     // Add clear button for debugging
                     const clearBtn = document.createElement('button');
-                    clearBtn.textContent = 'Clear';
+                    clearBtn.textContent = '×';
                     clearBtn.classList.add('qol-term-clear-btn');
-                    clearBtn.style.marginLeft = '8px';
-                    clearBtn.style.padding = '2px 6px';
-                    clearBtn.style.fontSize = '11px';
-                    clearBtn.style.cursor = 'pointer';
-                    clearBtn.style.backgroundColor = '#c62828';
-                    clearBtn.style.color = 'white';
-                    clearBtn.style.border = 'none';
-                    clearBtn.style.borderRadius = '3px';
                     clearBtn.title = 'Clear cached terminations for this segment';
                     
                     clearBtn.addEventListener('click', (e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        clearSegmentTerminations(segment, liElement);
+                        clearSegmentTerminations(segment);
                     });
                     
                     anchor.appendChild(clearBtn);
+
+                    if (!anchor.querySelector('.qol-term-legend')) {
+                        const legend = document.createElement('span');
+                        legend.className = 'qol-term-legend';
+                        legend.innerHTML = '<span class="qol-term-dot port"></span>port <span class="qol-term-dot open"></span>open cable end &nbsp;⇄ spliced here';
+                        anchor.appendChild(legend);
+                    }
                 } else {
                     statusElement.textContent = message;
+                    statusElement.title = message === PENDING_STATUS ? 'Updating terminations' : '';
                 }
+                // Fixed order: an earlier render (or Clear) can leave the legend ahead of a new status or ×
+                anchor.append(...['.qol-status-message', '.qol-term-clear-btn', '.qol-term-legend']
+                    .map((sel) => anchor.querySelector(`:scope > ${sel}`)).filter(Boolean));
             } catch (error) {
                 logger.error(FEATURE_NAME, `Error updating status message for segment: ${segment}`, error);
             }
         }
 
-        function clearSegmentTerminations(segment, liElement) {
+        function clearSegmentTerminations(segment) {
             try {
-                // Clear rendered terminations from DOM
-                if (liElement) {
-                    resetSegmentAnchors(liElement);
-                }
+                // Clear rendered terminations from every row of the segment
+                const rows = segmentElements(segment);
+                rows.forEach((liElement) => resetSegmentAnchors(liElement));
 
                 // Clear from in-memory batch state
                 segmentBatchState.delete(segment);
+                segmentOrientation.delete(segment);
+                failedPins.delete(segment);
 
                 // Clear from localStorage
                 const normalizedSegment = segment.replace(/out_|in_/g, '');
                 const [segmentType, segmentId] = normalizedSegment.split('/');
-                const cacheKey = segmentType;
+                const cacheKey = designCacheKey(segmentType, getCurrentDesign());
                 const cacheItem = localStorage.getItem(cacheKey);
                 
                 if (cacheItem) {
@@ -2794,18 +3604,20 @@
                 }
 
                 // Update status message
-                const anchor = findSegmentAnchor(segment);
-                if (anchor) {
+                rows.forEach((liElement) => {
+                    const anchor = segmentRowAnchor(liElement);
+                    if (!anchor) return;
                     const statusElement = anchor.querySelector('.qol-status-message');
                     if (statusElement) {
-                        statusElement.textContent = '(Cleared)';
+                        statusElement.textContent = 'Cleared';
+                        statusElement.title = '';
                         statusElement.style.color = '#999';
                     }
                     const clearBtn = anchor.querySelector('.qol-term-clear-btn');
                     if (clearBtn) {
                         clearBtn.remove();
                     }
-                }
+                });
 
                 logger.info(FEATURE_NAME, `Cleared terminations for segment: ${segment}`);
             } catch (error) {
@@ -2832,9 +3644,10 @@
             }
         }
 
-        async function populateSideInfo(side) {
+        async function populateSideInfo(side, forceRefresh = false) {
+            const design = getCurrentDesign();
             if (side.type === 'cable') {
-                const structureData = await getStructure(side);
+                const structureData = await getStructure(side, design, forceRefresh);
                 return { 
                     ...side, 
                     structureData: structureData,
@@ -2843,65 +3656,63 @@
             }
             // else if (side.feature.startsWith(FIBER_PATCH_PANEL) || side.feature.startsWith(FIBER_ONT)) {
             else if (side.type === PORT) {
-                const equipmentData = await getFeatureInfo(side.feature);
-                if (equipmentData.housingInfo) {
-                    return {
-                        ...side,
-                        equipmentInfo: equipmentData,
-                        housingInfo: equipmentData.housingInfo
-                    }
-                }
+                const equipmentData = await getFeatureInfo(side.feature, design, forceRefresh);
+                return {
+                    ...side,
+                    equipmentInfo: equipmentData,
+                    housingInfo: equipmentData?.housingInfo
+                };
             }
             return side;
         }
         
         function formatText(side) {
-            const desc = side.desc.replace(/#.*/g, '');
+            const desc = stripPinSuffix(side.desc);
             const featureType = side.feature.split('/')[1];
+
+            // "<text> - " when there is text, nothing otherwise (no "null" or stray spaces)
+            const prefix = (text) => (text ? `${text} - ` : '');
 
             const formatters = { // todo: change formatter to use housing structure type instead of equipment
                 ['building']: (side) => {
-                    let buildingDescription = side.endStructureData?.cust_name ? side.endStructureData.cust_name || side.endStructureData.name : '';
-                    if (side.type == PORT) {
-                        return `${buildingDescription} - Panel ${side.feature.split('/')[1]}, Port ${side.pin}`;
-                    } else {
-                        buildingDescription = side.endStructureData.name;
-                        return `${buildingDescription} - ${desc}, Strand ${side.pin}`;
-                    }
+                    const buildingDescription = side.endStructureData?.name || side.endStructureData?.cust_name;
+                    return `${prefix(buildingDescription)}${desc}, Strand ${side.pin}`;
                 },
                 ['fiber_patch_panel']: (side) => {
-                    let housingDescription = side.housingInfo?.name ? side.housingInfo.name || side.housingInfo.description : '';
-                    return `${housingDescription}${housingDescription ? ' -' : ''} Panel ${featureType}, Port ${side.pin}`;
+                    const housingDescription = side.housingInfo?.name || side.housingInfo?.description;
+                    return `${prefix(housingDescription)}Panel ${featureType}, Port ${side.pin}`;
                 },
                 ['fiber_splitter']: (side) => {
-                    let deviceId = side.equipmentInfo ? side.equipmentInfo.device_id || side.title.replace(/^Splitter: /, '') : '';
+                    const deviceId = side.equipmentInfo?.device_id || side.title?.replace(/^Splitter: /, '') || `Splitter ${featureType}`;
                     return `${deviceId}, Port ${side.pin}`;
                 },
-                ['fiber_mst']: (side) => `MST ${featureType}, Port ${side.pin}`,
+                ['fiber_mst']: (side) => `${prefix(endBuilding(side)?.name || endBuilding(side)?.address)}MST ${featureType}, Port ${side.pin}`,
+                ['fiber_sfp']: (side) => `${prefix(endBuilding(side)?.name || endBuilding(side)?.address)}SFP ${featureType}, Port ${side.pin}`,
+                ['cub_cpe']: (side) => `${prefix(endBuilding(side)?.name || endBuilding(side)?.address)}CPE ${featureType}, Port ${side.pin}`,
                 ['fiber_ont']: (side) => {
-                    let housingDescription = side.housingInfo ? side.housingInfo.cust_name || side.housingInfo.name || side.housingInfo.description : '';
-                    return `${housingDescription}${housingDescription ? ' -' : ''} ONT ${featureType}, Port ${side.pin}`;
+                    const housingDescription = side.housingInfo?.cust_name || side.housingInfo?.name || side.housingInfo?.description;
+                    return `${prefix(housingDescription)}ONT ${featureType}, Port ${side.pin}`;
                 },
                 ['shelf']: (side) => {
-                    let housingDescription = side.housingInfo ? side.housingInfo.description : '';
-                    return `${housingDescription}${housingDescription ? ' -' : ''} Shelf ${featureType}, Port ${side.pin}`;
+                    const housingDescription = side.housingInfo?.description;
+                    return `${prefix(housingDescription)}Shelf ${featureType}, Port ${side.pin}`;
                 },
                 ['migration_structure']: (side) => {
-                    let structureTitle = side.structureData ? side.structureData.end_structure_title.replace(/^Migration Structure:  /, '').replace(/Splice Closure/, 'Closure') : '';
-                    return `MS: ${structureTitle}${structureTitle ? ' -' : ''} ${desc}, Strand ${side.pin}`;
+                    const structureTitle = side.structureData?.end_structure_title?.replace(/^Migration Structure:\s+/, '').replace(/Splice Closure/, 'Closure') || '';
+                    return `MS: ${prefix(structureTitle)}${desc}, Strand ${side.pin}`;
                 },
                 ['manhole']: (side) => {
                     let strStructure = 'UUB: ';
                     let strTitle = '';
                     if (side.endStructureData) {
-                        strStructure = side.endStructureData.type === 'Handhole' ? 'HH: ' : 'MH: ';
-                        strTitle = side.structureData ? side.structureData.end_structure_title.replace(/UUB: /, '') : '';
+                        strStructure = `${uubBadge(side.endStructureData.type)}: `;
+                        strTitle = side.structureData?.end_structure_title?.replace(/UUB: /, '') || '';
                     }
-                    return `${strStructure}${strTitle}${strTitle ? ' -' : ''} ${desc}, Strand ${side.pin}`;
+                    return `${strStructure}${prefix(strTitle)}${desc}, Strand ${side.pin}`;
                 },
                 ['mywcom_route_junction']: (side) => {
-                    let structureTitle = side.structureData ? side.structureData.end_structure_title.replace(/Route /, '') : '';
-                    return `${structureTitle}${structureTitle ? ' -' : 'Junction'} ${desc}, Strand ${side.pin}`;
+                    const structureTitle = side.structureData?.end_structure_title?.replace(/Route /, '');
+                    return `${structureTitle ? prefix(structureTitle) : 'Junction '}${desc}, Strand ${side.pin}`;
                 },
                 default: (side) => `${desc}, Strand ${side.pin}`,
             };
@@ -2913,8 +3724,9 @@
                 let featureType;
                 if (side.type === PORT) {
                     featureType = side.feature.split('/')[0];
-                    if (featureType === FIBER_ONT && side.housingInfo) {
-                        hoverText = `${side.housingInfo.street_num} ${side.housingInfo.street}, ${side.housingInfo.city}`;
+                    if ((featureType === FIBER_ONT || endBuilding(side)) && side.housingInfo?.street) {
+                        const h = side.housingInfo;
+                        hoverText = [[h.street_num, h.street].filter(Boolean).join(' '), h.city].filter(Boolean).join(', ');
                     }
                 } else if (side.type === 'cable') {
                     featureType = side.structureData.end_structure_type;
@@ -2945,7 +3757,7 @@
             element.addEventListener('click', async function() {
                 let featureToSet = side.feature;
                 if (side.type == "cable") { // Use end structure instead of cable segment
-                    featureToSet = side == "in" ? side.structureData.in_structure : side.structureData.out_structure;
+                    featureToSet = side.side === 'in' ? side.structureData.in_structure : side.structureData.out_structure;
                 }
                 window.myw?.app?.setCurrentFeature(
                     await window.myw.app.database.getFeatureByUrn(featureToSet),
@@ -2956,26 +3768,43 @@
             return element;
         }
 
+        // forceRefresh may be a Map shared by one refresh (see newRefreshScope), so a feature that
+        // many strands end at is fetched fresh once per refresh, not once per strand
+        function newRefreshScope() {
+            return new Map();
+        }
+        function oncePerRefresh(scope, key, run) {
+            if (!scope.has(key)) {
+                scope.set(key, run().catch((e) => { scope.delete(key); throw e; }));
+            }
+            return scope.get(key);
+        }
+
         // Cache for promises returned by getStructure
         const structureRequests = {};
-        async function getStructure(side) {
+        async function getStructure(side, design = getCurrentDesign(), forceRefresh = false) {
+            if (forceRefresh instanceof Map) {
+                return oncePerRefresh(forceRefresh, `structure|${design}|${side.feature}:${side.side}`, () => getStructure(side, design, true));
+            }
             const structure = side.feature;
             const in_or_out = side.side;
+            // The end structure depends on which end of the segment, so the side is part of every key
+            const requestKey = `${design}|${structure}:${in_or_out}|${forceRefresh ? 'force' : ''}`;
 
-            if (structureRequests[structure]) {
-                return structureRequests[structure];
+            if (structureRequests[requestKey]) {
+                return structureRequests[requestKey];
             }
 
             // If there's no ongoing request, start one and store it in the cache
-            structureRequests[structure] = (async () => {
-                const [structureType, structureId] = structure.split('/');
+            structureRequests[requestKey] = (async () => {
+                const [structureType, segmentId] = structure.split('/');
+                const structureId = `${segmentId}:${in_or_out}`;
                 let structureData;
                 if (!forceRefresh) {
-                    structureData = await loadFeatureInfo(`structure_${structureType}`, structureId);
+                    structureData = await loadFeatureInfo(`structure_${structureType}`, structureId, design);
                 }
 
                 if (!structureData) {
-                    const design = getCurrentDesign();
                     const url = `${COMPANY_URL}/feature/${structure}?display_values=true&delta=${design}&application=mywcom&lang=en-US`;
                     const data = await fetchData(url);
 
@@ -3006,41 +3835,44 @@
                     structureData['end_structure_type'] = responseData.myw?.feature_type;
 
                     // Send request to get end_structure data
-                    const end_structure_data = await getFeatureInfo(end_structure);
+                    const end_structure_data = await getFeatureInfo(end_structure, design, forceRefresh);
                     structureData['end_structure'] = end_structure_data;
 
                     // Save to localStorage
-                    await saveFeatureInfo(`structure_${structureType}`, structureId, structureData);
+                    await saveFeatureInfo(`structure_${structureType}`, structureId, structureData, design);
                 }
 
                 return structureData;
             })();
 
             // When the request is complete, remove it from the cache
-            return structureRequests[structure].finally(() => {
-                delete structureRequests[structure];
+            return structureRequests[requestKey].finally(() => {
+                delete structureRequests[requestKey];
             });
         }
         
         // Cache for promises returned by getFeatureInfo
         const featureRequests = {};
-        async function getFeatureInfo(feature) {
-            // Check if there's an ongoing request for this feature
-            if (featureRequests[feature]) {
-                return featureRequests[feature];
+        async function getFeatureInfo(feature, design = getCurrentDesign(), forceRefresh = false) {
+            if (forceRefresh instanceof Map) {
+                return oncePerRefresh(forceRefresh, `feature|${design}|${feature}`, () => getFeatureInfo(feature, design, true));
             }
-        
+            const requestKey = `${design}|${feature}|${forceRefresh ? 'force' : ''}`;
+            // Check if there's an ongoing request for this feature
+            if (featureRequests[requestKey]) {
+                return featureRequests[requestKey];
+            }
+
             // If there's no ongoing request, start one and store it in the cache
-            featureRequests[feature] = (async () => {        
+            featureRequests[requestKey] = (async () => {
                 const [featureType, featureId] = feature.split('/');
                 let featureData;
                 if (!forceRefresh) {
-                    featureData = await loadFeatureInfo(featureType, featureId);
+                    featureData = await loadFeatureInfo(featureType, featureId, design);
                 }
 
                 if (!featureData) {
                     // If data doesn't exist in localStorage, fetch it
-                    const design = getCurrentDesign();
                     const url = `${COMPANY_URL}/feature/${feature}?display_values=true&delta=${design}&application=mywcom&lang=en-US`;
                     const data = await fetchData(url);
             
@@ -3063,28 +3895,29 @@
                     }
             
                     // Save to localStorage
-                    await saveFeatureInfo(featureType, featureId, featureData);
+                    await saveFeatureInfo(featureType, featureId, featureData, design);
                 }
-            
+
                 // If there is a second level feature, fetch it as well
                 const rootHousing = featureData.root_housing;
                 if (rootHousing && (rootHousing.startsWith('cabinet') || rootHousing.startsWith('building'))) {
-                    const housingData = await getFeatureInfo(rootHousing);  // Recursion
+                    const housingData = await getFeatureInfo(rootHousing, design, forceRefresh);  // Recursion
                     return { ...featureData, housingInfo: housingData };
                 }
-            
+
                 return featureData;
             })();
 
             // When the request is complete, remove it from the cache
-            return featureRequests[feature].finally(() => {
-                delete featureRequests[feature];
+            return featureRequests[requestKey].finally(() => {
+                delete featureRequests[requestKey];
             });
         }
 
-        async function loadFeatureInfo(featureType, featureId) {
-            // Load the data for the specified featureType
-            const item = localStorage.getItem(featureType);
+        async function loadFeatureInfo(featureType, featureId, design = getCurrentDesign()) {
+            // Load the data for the specified featureType (one localStorage entry per design)
+            const storageKey = designCacheKey(featureType, design);
+            const item = localStorage.getItem(storageKey);
             if (!item) {
                 return null;
             }
@@ -3107,18 +3940,19 @@
 
                 // Remove expired record from cache
                 delete existingData[featureId]; // Remove element from cached featureType data object
-                localStorage.setItem(featureType, JSON.stringify(existingData)); // Update featureType cache
-                
+                localStorage.setItem(storageKey, JSON.stringify(existingData)); // Update featureType cache
+
                 return null;
             }
-            
+
             return existingData[featureId].data;  // Return the data for the specified featureId
         }
 
-        async function saveFeatureInfo(featureType, featureId, newData) {
+        async function saveFeatureInfo(featureType, featureId, newData, design = getCurrentDesign()) {
+            const storageKey = designCacheKey(featureType, design);
             try {
                 // Load existing data or initialize an empty object
-                let existingData = localStorage.getItem(featureType);
+                let existingData = localStorage.getItem(storageKey);
                 existingData = existingData ? JSON.parse(existingData) : {};
             
                 // Update the data for the specified featureId
@@ -3127,7 +3961,7 @@
                     data: newData,
                 };
             
-                localStorage.setItem(featureType, JSON.stringify(existingData));
+                localStorage.setItem(storageKey, JSON.stringify(existingData));
                 return existingData[featureId].data;
                 
             } catch (error) {
@@ -3222,7 +4056,8 @@
 
         function mergeBatchStrands(segment, fiberCount, batchStrands, savedTimestamp) {
             const state = segmentBatchState.get(segment) || { strands: new Array(fiberCount), saved: savedTimestamp, fiberCount };
-            const merged = state.strands.length >= fiberCount ? state.strands : new Array(fiberCount);
+            // Growing (e.g. the real fiber count arrives after the cache) must keep what's already merged
+            const merged = state.strands.length >= fiberCount ? state.strands : Object.assign(new Array(fiberCount), state.strands);
             batchStrands.forEach((strand) => {
                 const pin = Number(strand.pin);
                 const idx = Number.isFinite(pin) ? Math.max(0, pin - 1) : merged.length;
@@ -3234,43 +4069,175 @@
 
         async function fetchSegmentBatch({ segment, startPin, endPin, design }) {
             const url = `${COMPANY_URL}/modules/comms/fiber/paths/${segment}?pins=in%3A${startPin}%3A${endPin}&full=false&delta=${design}&application=mywcom&lang=en-US`;
-            const data = await withInterceptPaused(() => fetchData(url, { timeoutMs: TERMINATION_TIMEOUT_MS }));
-            return data;
+            const timeoutMs = TERMINATION_TIMEOUT_BASE_MS + TERMINATION_TIMEOUT_PER_PIN_MS * (endPin - startPin + 1);
+            return fetchData(url, { timeoutMs });
+        }
+
+        // Mark a strand row whose trace failed, so it reads as done rather than still loading
+        function showFailedStrand(segment, pin, reason) {
+            openSegmentElements(segment).forEach((li) => markFailedStrandRow(segment, li, pin, reason));
+        }
+
+        function markFailedStrandRow(segment, li, pin, reason) {
+            const anchor = indexStrandAnchors(li)[pin];
+            if (!anchor) return;
+            try {
+                const row = prepareStrandLayout(anchor, pin);
+                const marker = document.createElement('span');
+                marker.className = 'qol-term-failed';
+                marker.textContent = '⚠ trace failed';
+                marker.title = reason;
+                row.querySelector('.qol-term-near').replaceChildren(marker);
+                row.querySelector('.qol-term-arrow').textContent = '';
+                row.querySelector('.qol-term-far').replaceChildren();
+                row.classList.remove('qol-term-has-path');
+                scheduleRefresh(li);
+            } catch (error) {
+                logger.warn(FEATURE_NAME, `Unable to mark failed strand ${pin} in ${segment}`, error);
+            }
+        }
+
+        // /fiber/paths/ returns 500 for some strands (e.g. a splice from a segment end back to
+        // itself), while trace_out still works. Use its tree to explain the failure on hover.
+        async function diagnoseFailedStrand(segment, pin, design) {
+            const fallback = 'IQGeo could not trace this strand (its own "Show terminations" fails too). "Trace both" may show where the path breaks.';
+            const from = encodeURIComponent(`${segment}?pins=in:${pin}`);
+            const url = `${COMPANY_URL}/network/mywcom_fiber/trace_out?from=${from}&direction=both&result_type=tree&max_nodes=20000&delta=${design}&application=mywcom&lang=en-US`;
+            try {
+                const data = await fetchData(url, { timeoutMs: 30000 });
+                // Same checks as the GIS team's search filters: an overlapping same-end splice is
+                // always wrong; a same-end loopback or a cable spliced to its own other end may be intentional.
+                const errors = [];
+                const possible = [];
+                Object.entries(data?.features || {}).forEach(([urn, f]) => {
+                    const p = f?.properties;
+                    if (!urn.startsWith('mywcom_fiber_connection/') || !p || p.in_object !== p.out_object) return;
+                    const where = [f.display_values?.housing || p.housing, f.display_values?.root_housing || p.root_housing].filter(Boolean).join(', ');
+                    const span = (lo, hi) => (lo === hi ? `${lo}` : `${lo}–${hi}`);
+                    const ranges = `fibers ${span(p.in_low, p.in_high)} ↔ ${span(p.out_low, p.out_high)}`;
+                    const at = `at ${where} (${urn})`;
+                    if (p.in_side !== p.out_side) {
+                        possible.push(`the cable's two ends are spliced together (${ranges}) ${at}`);
+                    } else if (p.in_low === p.out_low) {
+                        errors.push(p.in_low === p.in_high
+                            ? `fiber ${p.in_low} is spliced to itself ${at}`
+                            : `fibers ${span(p.in_low, p.in_high)} are spliced to themselves ${at}`);
+                    } else if (p.in_low <= p.out_high && p.out_low <= p.in_high) {
+                        errors.push(`overlapping splice on one cable end (${ranges}), so some fibers are spliced twice, ${at}`);
+                    } else {
+                        possible.push(`loopback on one cable end (${ranges}) ${at}`);
+                    }
+                });
+                if (errors.length) {
+                    const also = possible.length ? `\nAlso check (may be intentional):\n${possible.join('\n')}` : '';
+                    return `Trace failed: ${errors.join('\n')}\nFixing ${errors.length > 1 ? 'those connections' : 'that connection'} in IQGeo should fix the trace.${also}`;
+                }
+                if (possible.length) {
+                    return `Trace failed. Possible cause (may be intentional):\n${possible.join('\n')}`;
+                }
+                return fallback;
+            } catch (error) {
+                logger.debug(FEATURE_NAME, `trace_out diagnosis failed for ${segment} pin ${pin}`, error);
+                return fallback;
+            }
+        }
+
+        // Pin of the strand row nearest the middle of the visible tree (null if not rendered)
+        function visibleCenterPin(segment) {
+            const rows = openSegmentElements(segment).flatMap((li) => [...li.querySelectorAll('li.jstree-leaf > a.jstree-anchor[data-qol-pin]')]);
+            if (!rows.length) return null;
+            const container = findScrollContainer(rows[0]);
+            const isPage = container === document.scrollingElement || container === document.documentElement;
+            const box = isPage ? { top: 0, bottom: window.innerHeight } : container.getBoundingClientRect();
+            const mid = (box.top + box.bottom) / 2;
+            let best = null;
+            let bestDist = Infinity;
+            rows.forEach((a) => {
+                const r = a.getBoundingClientRect();
+                if (!r.height) return;
+                const dist = Math.abs((r.top + r.bottom) / 2 - mid);
+                if (dist < bestDist) { bestDist = dist; best = parseInt(a.dataset.qolPin, 10); }
+            });
+            return best;
+        }
+
+        // Fiber count per cable for this page session (one feature request per cable)
+        const cableFiberCounts = new Map(); // `${design}|${cable or segment}` -> Promise<count>
+        function getCableFiberCount(segment, cable, design) {
+            const key = `${design}|${cable || segment}`;
+            if (!cableFiberCounts.has(key)) {
+                const featureUrl = (urn) => `${COMPANY_URL}/feature/${urn}?display_values=true&delta=${design}&application=mywcom&lang=en-US`;
+                const request = (async () => {
+                    const cableUrn = cable || (await fetchData(featureUrl(segment)))?.properties?.cable;
+                    if (!cableUrn) return 0;
+                    return Number((await fetchData(featureUrl(cableUrn)))?.properties?.fiber_count) || 0;
+                })().catch((error) => {
+                    logger.debug(FEATURE_NAME, `Unable to get fiber count for ${cable || segment}`, error);
+                    return 0;
+                }).then((count) => {
+                    if (!count) cableFiberCounts.delete(key); // retry next time
+                    return count;
+                });
+                cableFiberCounts.set(key, request);
+            }
+            return cableFiberCounts.get(key);
         }
 
         // Cache for promises returned by getSegment
         const segmentRequests = {};
-        async function getSegment({segment, cable, fiberCount, interceptedData}, forceRefreshParam = false) {
+        async function getSegment({segment, cable, fiberCount, interceptedData}, forceRefresh = false) {
             // Don't fetch/render if feature is disabled
             if (!featureManager.isEnabled("Auto Terminations")) {
                 return Promise.resolve({ saved: null, data: [] });
             }
             
+            // Requests and state are per design (see syncDesignState)
+            const design = getCurrentDesign();
+            syncDesignState(design);
+            const requestKey = `${design}|${segment}`;
+
             // Check if there's an ongoing request for this segment
-            if (segmentRequests[segment]) {
-                return segmentRequests[segment];
+            if (segmentRequests[requestKey]) {
+                if (!interceptedData) {
+                    renderMissingRows(segment); // called again because the tree was rebuilt mid-load
+                    return segmentRequests[requestKey];
+                }
+                // IQGeo's own trace arrived while ours is loading: render it now and save it once ours
+                // finishes, since the in-flight request may return early without saving.
+                const interceptedStrands = normalizeStrands(interceptedData);
+                const known = segmentBatchState.get(segment);
+                mergeBatchStrands(segment, known?.fiberCount || interceptedStrands.length, interceptedStrands, Date.now());
+                showTerminations(segment, interceptedStrands, { forceRefresh: newRefreshScope() });
+                return segmentRequests[requestKey].then(async (result) => {
+                    if (getCurrentDesign() !== design) return result;
+                    const [segmentType, segmentId] = segment.replace(/in|out/, '').split('/');
+                    const strands = segmentBatchState.get(segment)?.strands.filter(Boolean) || [];
+                    if (strands.length) await saveFeatureInfo(segmentType, segmentId, strands, design);
+                    return result;
+                });
             }
 
             if (isSegmentExpanded(segment)) {
-                displayStatusMessage(segment, "Updating Terminations...");
+                displayStatusMessage(segment, PENDING_STATUS);
+                prepareSegment(segment); // align rows before any batch arrives
+                onStickyScroll();
             } else {
                 // Do not start work unless expanded
                 return Promise.resolve({ saved: null, data: [] });
             }
             
             // If there's no ongoing request, start one and store it in the cache
-            segmentRequests[segment] = (async () => {
-                // Set whether to override local storage
-                forceRefresh = forceRefreshParam;
+            segmentRequests[requestKey] = (async () => {
                 logger.log(FEATURE_NAME, `Getting segment: ${segment}, forceRefresh: ${forceRefresh}`);
+                const refresh = forceRefresh ? newRefreshScope() : false; // shared by every render of this load
                 if (forceRefresh) {
                     segmentBatchState.delete(segment);
+                    failedPins.delete(segment);
                 }
                 
                 const [segmentType, segmentId] = segment.replace(/in|out/, '').split('/');
                 let segmentData;
                 let cachedSaved = null;
-                let cached = null;
 
                 if (!forceRefresh) {
                     const state = segmentBatchState.get(segment);
@@ -3278,74 +4245,58 @@
                         segmentData = { saved: state.saved || Date.now(), data: state.strands.filter(Boolean) };
                     }
                     if (!segmentData) {
-                        cached = await loadFeatureInfo(segmentType, segmentId);
+                        const cached = await loadFeatureInfo(segmentType, segmentId, design);
                         if (cached) {
                             try {
-                                const cacheRaw = JSON.parse(localStorage.getItem(segmentType) || "{}");
+                                const cacheRaw = JSON.parse(localStorage.getItem(designCacheKey(segmentType, design)) || "{}");
                                 cachedSaved = cacheRaw?.[segmentId]?.saved || null;
                             } catch (e) {
                                 /* ignore cache parse issues */
                             }
                             segmentData = { saved: cachedSaved, data: cached };
-                            const cachedPins = Array.isArray(cached) ? cached.map((s) => parseInt(s.pin, 10)).filter(Number.isFinite) : [];
-                            const inferredCount = Math.max(...cachedPins, 0);
-                            segmentBatchState.set(segment, { strands: cached, saved: cachedSaved, fiberCount: inferredCount || fiberCount || 0 });
                         }
                     }
                 }
-                const design = getCurrentDesign();
 
-                // Ensure fiberCount
-                if (!fiberCount) {
-                    const state = segmentBatchState.get(segment);
-                    if (state?.fiberCount) {
-                        fiberCount = state.fiberCount;
-                    }
-                }
-                if (!fiberCount && segmentData?.data?.length) {
-                    const pins = segmentData.data
-                        .map((s) => parseInt(s.pin, 10))
-                        .filter(Number.isFinite);
-                    fiberCount = Math.max(...pins, fiberCount || 0);
+                // Show cached immediately
+                const cachedStrands = segmentData?.data || [];
+                if (cachedStrands.length) {
+                    const savedTs = segmentData.saved || Date.now();
+                    mergeBatchStrands(segment, fiberCount || segmentBatchState.get(segment)?.fiberCount || cachedStrands.length, cachedStrands, savedTs);
+                    showTerminations(segment, cachedStrands);
+                    displayStatusMessage(segment, null, savedTs);
                 }
 
+                // Fiber count: the cable's own count; the highest known pin only as a last resort,
+                // since strands at the end that failed earlier would otherwise never be fetched
                 if (!fiberCount && !interceptedData) {
-                    if (cable) {
-                        const fiberCountData = await fetchData(`${COMPANY_URL}/feature/${cable}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
-                        fiberCount = fiberCountData.properties.fiber_count;
-                    } else {
-                        const segmentDataInfo = await fetchData(`${COMPANY_URL}/feature/${segment}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
-                        cable = segmentDataInfo.properties.cable;
-                        if (cable) {
-                            const fiberCountData = await fetchData(`${COMPANY_URL}/feature/${cable}?display_values=true&delta=${design}&application=mywcom&lang=en-US`);
-                            fiberCount = fiberCountData.properties.fiber_count;
-                        }
-                    }
+                    fiberCount = await getCableFiberCount(segment, cable, design);
+                }
+                if (!fiberCount) {
+                    fiberCount = segmentBatchState.get(segment)?.fiberCount || 0;
+                }
+                if (!fiberCount && cachedStrands.length) {
+                    const pins = cachedStrands.map((s) => parseInt(s.pin, 10)).filter(Number.isFinite);
+                    fiberCount = Math.max(...pins, 0);
                 }
 
                 // Determine missing pins from current state/cache
-                const currentState = segmentBatchState.get(segment);
-                const currentStrands = currentState?.strands || segmentData?.data || [];
+                const currentStrands = segmentBatchState.get(segment)?.strands || cachedStrands;
                 const knownPins = new Set(
                     (currentStrands || []).map((s) => parseInt(s?.pin, 10)).filter(Number.isFinite)
                 );
                 const missingPins = [];
+                const knownFailed = failedPins.get(segment);
                 if (fiberCount) {
                     for (let pin = 1; pin <= fiberCount; pin++) {
-                        if (!knownPins.has(pin)) {
+                        if (!knownPins.has(pin) && !knownFailed?.has(pin)) {
                             missingPins.push(pin);
                         }
                     }
                 }
                 logger.debug(FEATURE_NAME, 'missingPins', segment, missingPins.length ? `${missingPins[0]}-${missingPins[missingPins.length - 1]} (count ${missingPins.length})` : 'none');
 
-                // Show cached immediately
-                if (currentStrands && currentStrands.length) {
-                    const savedTs = segmentData?.saved || cachedSaved || Date.now();
-                    mergeBatchStrands(segment, fiberCount || currentStrands.length, currentStrands, savedTs);
-                    showTerminations(segment, currentStrands);
-                    displayStatusMessage(segment, null, savedTs);
-                }
+                knownFailed?.forEach((reason, pin) => showFailedStrand(segment, pin, reason));
 
                 // Nothing missing: finalize status and return
                 if (!missingPins.length && segmentData) {
@@ -3382,46 +4333,82 @@
                         return ranges;
                     };
 
-                    // Recursive splitter: shrink only the failing range, not future batches
+                    // Shared queue: a failing range is split in half and both halves go back
+                    // in the queue, so other workers can take them and concurrency stays capped.
+                    const queue = buildRangesFromPins(missingPins, baseBatchSize);
+                    const renders = [];
+
+                    // Take the range nearest the rows on screen, so what the user sees fills first
+                    const takeNext = () => {
+                        const center = visibleCenterPin(segment);
+                        let pick = 0;
+                        if (center !== null) {
+                            const dist = ({ startPin, endPin }) => (center < startPin ? startPin - center : center > endPin ? center - endPin : 0);
+                            queue.forEach((r, i) => { if (dist(r) < dist(queue[pick])) pick = i; });
+                        }
+                        return queue.splice(pick, 1)[0];
+                    };
+
                     const fetchRange = async (startPin, endPin) => {
-                        if (startPin > endPin) return;
                         try {
                             const batchData = await fetchSegmentBatch({ segment, startPin, endPin, design });
+                            if (getCurrentDesign() !== design) return; // design switched mid-load; drop stale results
                             const batchStrands = normalizeStrands(batchData);
                             mergeBatchStrands(segment, fiberCount, batchStrands, Date.now());
-                            showTerminations(segment, batchStrands);
+                            renders.push(showTerminations(segment, batchStrands, { forceRefresh: refresh }));
+                            ensurePendingStatus(segment);
                             logger.debug(FEATURE_NAME, `batch ${startPin}-${endPin} ok for ${segment} (seq ${renderSequence})`);
                         } catch (err) {
-                            const size = endPin - startPin + 1;
+                            if (getCurrentDesign() !== design) return;
                             // Suppress batch split warnings; only log single strand failures
-                            if (size > 1) {
+                            if (endPin > startPin) {
                                 const mid = Math.floor((startPin + endPin) / 2);
-                                await fetchRange(startPin, mid);
-                                await fetchRange(mid + 1, endPin);
+                                queue.push({ startPin, endPin: mid }, { startPin: mid + 1, endPin });
                             } else {
+                                if (!failedPins.has(segment)) failedPins.set(segment, new Map());
+                                const failures = failedPins.get(segment);
+                                failures.set(startPin, 'Trace failed. Checking why…');
+                                showFailedStrand(segment, startPin, failures.get(startPin));
                                 logger.warn(FEATURE_NAME, `strand ${startPin} failed for ${segment}`, err);
+                                diagnoseFailedStrand(segment, startPin, design).then((reason) => {
+                                    if (failedPins.get(segment) !== failures) return; // cleared or refreshed meanwhile
+                                    failures.set(startPin, reason);
+                                    showFailedStrand(segment, startPin, reason);
+                                });
                             }
                         }
                     };
 
-                    const ranges = buildRangesFromPins(missingPins, baseBatchSize);
-
-                    // Process base ranges with limited concurrency
-                    let idx = 0;
-                    const worker = async () => {
-                        while (idx < ranges.length) {
-                            const { startPin, endPin } = ranges[idx++];
-                            await fetchRange(startPin, endPin);
+                    // Keep up to MAX_CONCURRENCY requests in flight; each finish refills the slots
+                    // (a split may have queued new halves). fetchRange never rejects.
+                    let active = 0;
+                    let finish;
+                    const allDone = new Promise((resolve) => { finish = resolve; });
+                    const topUp = () => {
+                        while (active < TERMINATION_MAX_CONCURRENCY && queue.length) {
+                            active++;
+                            const { startPin, endPin } = takeNext();
+                            fetchRange(startPin, endPin).finally(() => {
+                                active--;
+                                topUp();
+                                if (!active && !queue.length) finish();
+                            });
                         }
                     };
-                    const workers = Array.from({ length: Math.min(TERMINATION_MAX_CONCURRENCY, ranges.length) }, () => worker());
-                    await Promise.allSettled(workers);
+                    topUp();
+                    if (!active) finish();
+                    await allDone;
+                    await Promise.all(renders);
+                    if (getCurrentDesign() === design) await renderMissingRows(segment);
 
                     const mergedState = segmentBatchState.get(segment);
                     newData = mergedState ? mergedState.strands.filter(Boolean) : [];
                 } else {
-                    newData = normalizeStrands(interceptedData);
-                    mergeBatchStrands(segment, fiberCount || newData.length, newData, Date.now());
+                    // IQGeo's own trace (e.g. "Show terminations"): render it now, not only on the next load
+                    const interceptedStrands = normalizeStrands(interceptedData);
+                    mergeBatchStrands(segment, fiberCount || interceptedStrands.length, interceptedStrands, Date.now());
+                    showTerminations(segment, interceptedStrands, { forceRefresh: refresh });
+                    newData = segmentBatchState.get(segment).strands.filter(Boolean);
                 }
 
                 segmentData = {
@@ -3429,17 +4416,19 @@
                     data: newData
                 };
     
-                await saveFeatureInfo(segmentType, segmentId, newData); // 2025-11-17: Changed to save 'strands' instead of 'segmentData' to fix accidentally nesting in localStorage
+                if (getCurrentDesign() !== design) return null; // design switched mid-load; state now belongs to the new design
+                await saveFeatureInfo(segmentType, segmentId, newData, design); // 2025-11-17: Changed to save 'strands' instead of 'segmentData' to fix accidentally nesting in localStorage
         
                 return segmentData;
             })().then(result => {
+                if (!result) return { saved: null, data: [] };
                 displayStatusMessage(segment, null, result.saved);
                 return result;
             });
 
             // When the request is complete, remove it from the cache
-            return segmentRequests[segment].finally(() => {
-                delete segmentRequests[segment];
+            return segmentRequests[requestKey].finally(() => {
+                delete segmentRequests[requestKey];
             });
         } // todo: rename segmentData to terminationData and move related code to separate function (getTerminations?)
         
@@ -3457,8 +4446,7 @@
 
             // Defer fetching until the segment is expanded; listeners handle it
             routeSegments.forEach(({ segment, cable, fiberCount }) => {
-                const anchor = findSegmentAnchor(segment);
-                if (anchor && anchor.getAttribute('aria-expanded') === 'true') {
+                if (isSegmentExpanded(segment)) {
                     getSegment({ segment, cable, fiberCount });
                 }
             });
@@ -3477,7 +4465,9 @@
         async function fetchData(url, { timeoutMs } = {}) {
             const timeout = timeoutMs ? abortableTimeoutController(timeoutMs) : null;
             try {
-                const response = await fetch(url, timeout ? { signal: timeout.controller.signal } : undefined);
+                const init = { [QOL_OWN_REQUEST]: true };
+                if (timeout) init.signal = timeout.controller.signal;
+                const response = await fetch(url, init);
                 const data = await response.json();
                 return data;
             } catch (error) {
@@ -3503,12 +4493,13 @@
         }
 
         function patchCableTreeHandlers() {
-            if (cableTreePatched) return true;
+            // Each view is patched once; the route view can be created after the struct view
+            const cableTree = window.myw?.app?.plugins?.cableTree;
             const treeViews = [
-                window.myw?.app?.plugins?.cableTree?.structCableTreeView,
-                window.myw?.app?.plugins?.cableTree?.routeTreeView
-            ].filter(Boolean);
-            if (!treeViews.length) return false;
+                [cableTree?.structCableTreeView, 'struct'],
+                [cableTree?.routeTreeView, 'route']
+            ].filter(([tv]) => tv && !patchedTreeViews.has(tv));
+            if (!treeViews.length) return;
 
             const patchOne = (treeView, label) => {
                 if (!treeView || typeof treeView.setEventHandlers !== 'function') return;
@@ -3572,13 +4563,11 @@
                 };
             };
 
-            treeViews.forEach((tv, idx) => {
-                patchOne(tv, idx === 0 ? 'struct' : 'route');
+            treeViews.forEach(([tv, label]) => {
+                patchOne(tv, label);
                 applyGeomRepForPatch(tv);
+                patchedTreeViews.add(tv);
             });
-
-            cableTreePatched = true;
-            return true;
         }
 
         function patchCableTreeShow() {
@@ -3602,6 +4591,7 @@
         }
 
         async function setupMutationObserver() {
+            enableStickyHeaders();
             if (termMutationObserver) {
                 return;
             }
@@ -3630,23 +4620,52 @@
                 termMutationObserver = null;
             }
             // Clean up all termination UI when stopping
+            disableStickyHeaders();
             cleanupTerminationUI();
         }
         
         function cleanupTerminationUI() {
             // Remove all injected termination elements from the tree
-            const tree = document.querySelector('#related-equipment-tree-container');
-            if (tree) {
-                tree.querySelectorAll('.qol-term-row, .qol-status-message').forEach((el) => el.remove());
-                tree.querySelectorAll('a.jstree-anchor.qol-term').forEach((anchor) => {
-                    anchor.classList.remove('qol-term');
-                    if (anchor.dataset.qolOriginalHtml) {
-                        anchor.innerHTML = anchor.dataset.qolOriginalHtml;
-                    }
-                });
-            }
+            document.querySelectorAll('a.jstree-anchor.qol-term, a.jstree-anchor.qol-term-layout').forEach((anchor) => {
+                anchor.classList.remove('qol-term', 'qol-term-layout');
+                delete anchor.dataset.qolPin;
+                if (anchor.dataset.qolOriginalHtml) {
+                    anchor.innerHTML = anchor.dataset.qolOriginalHtml;
+                }
+            });
+            document.querySelectorAll('.qol-term-row, .qol-status-message, .qol-term-clear-btn, .qol-term-legend').forEach((el) => el.remove());
+            document.querySelectorAll('li[style*="--qol-term"]').forEach((li) => {
+                TERM_COLUMN_VARS.forEach((v) => li.style.removeProperty(v));
+            });
+            segmentOrientation.clear();
         }
     
+        if (typeof window !== 'undefined') {
+            window.qolTerminations = {
+                settings: () => loadTermDisplay(),
+                set: (key, value) => {
+                    if (!(key in TERM_DISPLAY_DEFAULTS)) {
+                        console.warn(`[qolTerminations] Unknown setting "${key}". Use: ${Object.keys(TERM_DISPLAY_DEFAULTS).join(', ')}`);
+                        return;
+                    }
+                    const next = { ...loadTermDisplay(), [key]: value };
+                    try { localStorage.setItem(TERM_DISPLAY_KEY, JSON.stringify(next)); } catch (e) { /* storage unavailable */ }
+                    applyTermDisplay(next);
+                    remeasureAllSegments();
+                    onStickyScroll();
+                    return next;
+                },
+                help: () => console.log([
+                    '[qolTerminations] Display settings:',
+                    '  qolTerminations.set("spliceText", "full")   - show IQGeo splice text in full ("compact" = chip)',
+                    '  qolTerminations.set("secondary", false)     - hide the muted second name (shown in hover)',
+                    '  qolTerminations.set("stickyHeader", false)  - stop pinning the open cable and segment rows',
+                    '  qolTerminations.set("repeats", "bold")      - names repeating the row above: "fade" (default), "bold" run starts, "none"',
+                    '  qolTerminations.settings()                  - current settings'
+                ].join('\n'))
+            };
+        }
+
         return {
             setupMutationObserver: setupMutationObserver,
             setupTreeListeners: setupTreeListeners,
@@ -4935,14 +5954,24 @@
             window.fetch = function (...args) {
                 return origFetch.apply(this, args).then((res) => {
                     const url = res?.url || args[0] || '';
-                    if (!res.ok) {
+                    // The script's own trace 500s (bad splice data) are marked and explained on the strand row
+                    const ownTrace500 = res.status === 500 && args[1]?.[QOL_OWN_REQUEST] === true
+                        && /\/modules\/comms\/fiber\/paths\//.test(url);
+                    if (!res.ok && !ownTrace500) {
                         if (!(res.status === 404 && IGNORE_404_PATTERNS.some((p) => p.test(url)))) {
                             addLog({ type: 'network', method: 'fetch', status: res.status, url, message: `${res.status} ${res.statusText}` });
                         }
                     }
                     return res;
                 }).catch((err) => {
-                    addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: err.toString() });
+                    // The script's own timeouts (slow traces) are retried and, if they keep failing,
+                    // marked on the strand row; logging them here would only be noise
+                    const init = args[1];
+                    const ownTimeout = init?.[QOL_OWN_REQUEST] === true && init.signal?.aborted
+                        && String(init.signal.reason).startsWith('timeout_');
+                    if (!ownTimeout) {
+                        addLog({ type: 'network', method: 'fetch', status: 'ERR', url: args[0] || '', message: String(err) });
+                    }
                     throw err;
                 });
             };
@@ -6124,143 +7153,6 @@
             console.info('[userscript] Patched MapControl._showTooltip: trace tooltip segment ID fix');
         }
 
-        // TEMP HOTFIX (IQG-35186): /search endpoint returns 500s after upgrade to core v7.5.3, comms v3.6.7
-        // Restore partial search functionality using the local query-suggestion fast
-        // path designed for other datasource types which skips the server call.
-        // Free-text search with no canned match is unaffected and will still 500.
-        // Remove once the server-side /search regression is fixed.
-        const getMywDatasource = () => {
-            try {
-                return window.myw?.app?.database?.getDatasource('myworld') || null;
-            } catch { return null; }
-        };
-        function applySearchSuggestionsWorkaround(ds) {
-            ds.options.fullQuery = true;
-            ds.options.inWindowQuery = true;
-            ds.options.inSelectionQuery = true;
-
-            fetch('config/dd/myworld/queries', { credentials: 'same-origin' })
-                .then(res => {
-                    if (!res.ok) throw new Error(`config/dd/myworld/queries returned ${res.status}`);
-                    return res.json();
-                })
-                .then(({ queries = [] }) => {
-                    queries.forEach(row => {
-                        const featureDD = ds.featuresDD[row.feature_name];
-                        if (!featureDD) return;
-
-                        featureDD.queries = featureDD.queries || [];
-                        featureDD.queries.push({
-                            lang: row.lang,
-                            matched_value: row.myw_search_val1,
-                            display_value: row.myw_search_desc1,
-                            attrib_query: row.attrib_query
-                        });
-                    });
-                    Object.defineProperty(ds, '__searchSuggestionsWorkaroundPatched', { value: true });
-                    console.info('[userscript] TEMP: backfilled canned query suggestions for myworld datasource');
-                })
-                .catch(e => console.error('[userscript] TEMP: failed to backfill canned query suggestions', e));
-        }
-
-        // TEMP HOTFIX (IQG-35186): companion to the search-suggestions workaround above - adds
-        // a search-by-id provider so a bare id number can still resolve a feature while /search
-        // is down. Uses feature/{type}?filter=[id]={id} (RestServer.getFeatures), a separate
-        // endpoint from /search, so it isn't affected by the regression. Also short-circuits the
-        // built-in "myw" provider for numeric input so it stops eating a guaranteed 500 on every
-        // id search.
-        // Deliberately scoped to mywcom.cables/.routes/.structures/.equipment (~50 types) rather
-        // than every loaded feature type (~150) - covers realistic id lookups without the extra
-        // request fan-out. An id for a type outside those categories won't be found here.
-        // Remove alongside applySearchSuggestionsWorkaround once /search is fixed.
-        const getSearchControl = () => {
-            try { return window.myw?.app?.layout?.controls?.search || null; }
-            catch { return null; }
-        };
-        const ID_SEARCH_SETTLE_MS = 600;
-        const ID_SEARCH_PRIORITY_SETTINGS = ['mywcom.cables', 'mywcom.routes', 'mywcom.structures', 'mywcom.equipment'];
-        function applyIdSearchProvider(searchControl) {
-            const ds = getMywDatasource();
-            if (!ds) throw new Error('id search provider: myworld datasource not available');
-
-            const typePriority = new Map();
-            ID_SEARCH_PRIORITY_SETTINGS.forEach((settingKey, rank) => {
-                Object.keys(window.myw?.app?.system?.settings?.[settingKey] || {}).forEach(type => {
-                    if (!typePriority.has(type)) typePriority.set(type, rank);
-                });
-            });
-            const idSearchTypes = Array.from(typePriority.keys());
-
-            async function idSearchProvider(searchText) {
-                if (!/^\d+$/.test(searchText)) return [];
-
-                // Extra settle delay on top of SearchControl's own debounce, specific to this
-                // provider, so we don't fire a request per type for every digit typed.
-                await new Promise(resolve => setTimeout(resolve, ID_SEARCH_SETTLE_MS));
-                if (searchControl.getSearchText() !== searchText) return [];
-
-                const types = idSearchTypes;
-                const results = await Promise.allSettled(
-                    types.map(type => ds.getFeatures(type, { filter: `[id]=${searchText}`, limit: 1 }))
-                );
-
-                const suggestions = [];
-                let loggedFailure = false;
-                results.forEach((result, i) => {
-                    if (result.status === 'rejected') {
-                        if (!loggedFailure) {
-                            console.error('[userscript] TEMP: id search sweep failed for one or more types', result.reason);
-                            loggedFailure = true;
-                        }
-                        return;
-                    }
-                    if (!result.value.length) return;
-
-                    const type = types[i];
-                    suggestions.push({
-                        type: 'feature',
-                        label: `${result.value[0].getTitle()} (${type})`,
-                        value: searchText,
-                        data: { urn: `${type}/${searchText}` },
-                        datasource: 'myworld'
-                    });
-                });
-
-                suggestions.sort((a, b) => typePriority.get(a.data.urn.split('/')[0]) - typePriority.get(b.data.urn.split('/')[0]));
-                return suggestions;
-            }
-
-            // allSuggestions()/searchFor() both iterate Object.values(providers) to build the
-            // flat, displayed list in insertion order - a plain `providers.qolIdSearch = ...`
-            // would land after "places" (Google), since that's the last existing key. Rebuild
-            // the object instead so id results are inserted right after "myw", ahead of
-            // externals/places.
-            const qolIdSearchProviderEntry = {
-                type: 'qolIdSearch',
-                title: undefined,
-                search: idSearchProvider
-            };
-            const reorderedProviders = {};
-            Object.entries(searchControl.providers).forEach(([key, provider]) => {
-                reorderedProviders[key] = provider;
-                if (key === 'myw') reorderedProviders.qolIdSearch = qolIdSearchProviderEntry;
-            });
-            if (!reorderedProviders.qolIdSearch) reorderedProviders.qolIdSearch = qolIdSearchProviderEntry;
-            searchControl.providers = reorderedProviders;
-
-            // The built-in "myw" provider still fires on every search, including numeric ones -
-            // that's a guaranteed /search 500 for input the id search provider above already
-            // covers locally. Short-circuit it for numeric input instead of eating that request.
-            const originalMywSearch = searchControl.providers.myw?.search;
-            if (typeof originalMywSearch === 'function') {
-                searchControl.providers.myw.search = (searchText, bounds) =>
-                    /^\d+$/.test(searchText) ? Promise.resolve([]) : originalMywSearch(searchText, bounds);
-            }
-
-            Object.defineProperty(searchControl, '__idSearchProviderPatched', { value: true });
-            console.info('[userscript] Patched searchControl: id-number search provider (TEMP)');
-        }
-
         function applyPatches() {
             // Each entry is applied the instant its target becomes available - whether
             // that's immediately on page load or only after the user opens a panel
@@ -6276,8 +7168,6 @@
             registerPatch(getStreetviewReady, sv => !!sv.__svCollapsePatchApplied, applyStreetviewPlugin, 'streetview collapse');
             registerPatch(getMapForTraceTooltip, m => !!m.constructor.prototype._qolTooltipPatched, applyTraceTooltipSegIds, 'trace tooltip seg ids');
             registerPatch(getMapForCopyCoordinate, m => !!m.__copyCoordinatePatched, applyCopyCoordinatePatch, 'copyCoordinate');
-            registerPatch(getMywDatasource, ds => !!ds.__searchSuggestionsWorkaroundPatched, applySearchSuggestionsWorkaround, 'search suggestions workaround (TEMP)');
-            registerPatch(getSearchControl, sc => !!sc.__idSearchProviderPatched, applyIdSearchProvider, 'id search provider (TEMP)');
         }
 
         function start() {
